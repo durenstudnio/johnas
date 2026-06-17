@@ -11,7 +11,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Zwolnij miejsce na dysku (~20GB) ────────────────────────────────
+      # ── Zwolnij miejsce na dysku ────────────────────────────────
       - name: Zwolnij miejsce na dysku
         run: |
           echo "Przed:"
@@ -22,116 +22,98 @@ jobs:
             /opt/ghc \
             /opt/hostedtoolcache/CodeQL \
             /usr/local/share/boost \
-            "$AGENT_TOOLSDIRECTORY"
+            "$AGENT_TOOLSDIRECTORY" || true
           sudo apt-get clean
           docker rmi $(docker images -q) 2>/dev/null || true
           echo "Po:"
           df -h /
 
-      # ── Narzędzia systemowe ──────────────────────────────────────────────
+      # ── Zależności ──────────────────────────────────────────────
       - name: Zainstaluj zależności
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
             lz4 brotli python3 python3-pip \
-            python3-protobuf python3-crypto \
             zip unzip tar pv wget curl
           pip3 install gdown
 
-      # ── Sprawdź wolne miejsce ────────────────────────────────────────────
       - name: Sprawdź dysk
         run: df -h
 
-      # ── Pobierz OTA zip z Google Drive (STAŁE ID) ──────────────────────
+      # ── OTA ─────────────────────────────────────────────────────
       - name: Pobierz OTA zip z Google Drive
         run: |
           mkdir -p ota
           gdown "1YnKZ9qrNmfaEDrI10pkdkSCVevBoUxBh" -O ota/ota.zip
+
           SIZE=$(stat -c%s ota/ota.zip 2>/dev/null || echo 0)
           if [ "$SIZE" -lt 1048576 ]; then
-            echo "❌ Pobrany plik OTA ma tylko $SIZE bajtów"
+            echo "❌ OTA za mały: $SIZE"
             exit 1
           fi
-          ls -lh ota/
 
-      # ── Pobierz bazowy AP (ZIP) i rozpakuj go (STAŁE ID) ──────────────
-      - name: Pobierz bazowy AP z Google Drive i rozpakuj ZIP
+      - name: Rozpakuj OTA
+        run: |
+          mkdir -p ota_extracted
+          unzip -q ota/ota.zip -d ota_extracted
+          rm ota/ota.zip
+
+      # ── Base firmware ───────────────────────────────────────────
+      - name: Pobierz AP base
         run: |
           mkdir -p base_fw
           gdown "1ugH_mcYrIwuPgUJh4qeeE4AucdzbgNHI" -O base_fw/base.zip
-
           unzip -q base_fw/base.zip -d base_fw/
 
           TAR_MD5=$(find base_fw/ -maxdepth 1 -name "*.tar.md5" | head -1)
           if [ -z "$TAR_MD5" ]; then
-            echo "❌ Nie znaleziono pliku .tar.md5 w archiwum ZIP"
+            echo "❌ brak tar.md5"
             exit 1
           fi
 
           mv "$TAR_MD5" base_fw/AP_base.tar.md5
-          rm -f base_fw/base.zip
-          ls -lh base_fw/
 
-      # ── Wypakuj OTA zip ──────────────────────────────────────────────────
-      - name: Wypakuj OTA zip
-        run: |
-          mkdir -p ota_extracted
-          unzip -q ota/ota.zip -d ota_extracted
-          ls -lh ota_extracted/
-          rm ota/ota.zip
-
-      # ── Wypakuj bazowy AP tar ────────────────────────────────────────────
+      # ── Extract base ─────────────────────────────────────────────
       - name: Wypakuj AP tar
         run: |
           mkdir -p base_extracted
           cd base_extracted
-          # Bezpieczne usunięcie 33-bajtowego suffixu MD5
           tail -c +33 ../base_fw/AP_base.tar.md5 | tar x
-          ls -lh
-          rm ../base_fw/AP_base.tar.md5
 
-      # ── Zdekompresuj obrazy lz4 ─────────────────────────────────────────
-      - name: Zdekompresuj obrazy lz4
+      # ── lz4 ─────────────────────────────────────────────────────
+      - name: Dekompresja lz4
         run: |
           cd base_extracted
           for f in *.lz4; do
             [ -f "$f" ] || continue
-            echo "Dekompresuję: $f"
             lz4 -d "$f" "${f%.lz4}"
             rm "$f"
           done
-          ls -lh *.img 2>/dev/null || echo "Brak .img"
 
-      # ── lpunpack – wyciągnij partycje z super.img ──────────────────────
-      - name: Zainstaluj lpunpack (z Twojego źródła)
+      # ── lpunpack ────────────────────────────────────────────────
+      - name: Install lpunpack
         run: |
-          wget -q --header="User-Agent: Mozilla/5.0" \
-            https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpunpack
+          wget -q https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpunpack
           chmod +x lpunpack
           sudo mv lpunpack /usr/local/bin/
-          lpunpack --help || echo "lpunpack installed"
 
-      - name: Wypakuj partycje z super.img
+      - name: Unpack super.img
         run: |
           mkdir -p partitions
           if [ -f base_extracted/super.img ]; then
             lpunpack base_extracted/super.img partitions/
-            ls -lh partitions/
           else
-            echo "Brak super.img – kopiuję osobne obrazy"
             cp base_extracted/*.img partitions/ 2>/dev/null || true
           fi
 
-      # ── Pobierz narzędzia BLOCK OTA (commaai) ──────────────────────────
-      - name: Pobierz narzędzia BLOCK OTA
+      # ── OTA tools ───────────────────────────────────────────────
+      - name: Pobierz block OTA tools
         run: |
-          wget -q -O blockimgdiff.py \
-            https://raw.githubusercontent.com/commaai/android_build/refs/heads/master/tools/releasetools/blockimgdiff.py
-          wget -q -O rangelib.py \
-            https://raw.githubusercontent.com/commaai/android_build/refs/heads/master/tools/releasetools/rangelib.py
+          wget -q https://raw.githubusercontent.com/commaai/android_build/refs/heads/master/tools/releasetools/blockimgdiff.py
+          wget -q https://raw.githubusercontent.com/commaai/android_build/refs/heads/master/tools/releasetools/rangelib.py
 
-      # ── Zastosuj patche dla każdej partycji ─────────────────────────────
-      - name: Zastosuj BLOCK OTA patche
+      # ── Patch OTA ───────────────────────────────────────────────
+      - name: Apply OTA patches
         run: |
           mkdir -p output_partitions
           OTA_DIR="ota_extracted"
@@ -140,25 +122,21 @@ jobs:
           for tlist in "$OTA_DIR"/*.transfer.list; do
             [ -f "$tlist" ] || continue
             PART=$(basename "$tlist" .transfer.list)
-            echo "━━━ Partycja: $PART ━━━"
 
-            NEW_DAT_BR="$OTA_DIR/${PART}.new.dat.br"
             NEW_DAT="$OTA_DIR/${PART}.new.dat"
+            NEW_DAT_BR="$OTA_DIR/${PART}.new.dat.br"
             PATCH_DAT="$OTA_DIR/${PART}.patch.dat"
 
             if [ -f "$NEW_DAT_BR" ]; then
-              echo "  Dekompresuję brotli..."
               brotli -d "$NEW_DAT_BR" -o "$NEW_DAT"
             fi
 
             SRC_IMG=$(ls partitions/${PART}.img 2>/dev/null | head -1)
-
             if [ -z "$SRC_IMG" ]; then
-              echo "  ⚠️  Brak źródłowego obrazu dla $PART, pomijam"
+              echo "Brak $PART"
               continue
             fi
 
-            echo "  Źródło: $SRC_IMG"
             cp "$SRC_IMG" "output_partitions/${PART}.img"
 
             python3 blockimgdiff.py \
@@ -166,42 +144,32 @@ jobs:
               --transfer "$tlist" \
               --new_data "$NEW_DAT" \
               --patch "$PATCH_DAT" \
-              --output "output_partitions/${PART}.img.new"
+              --output "output_partitions/${PART}.img.new" || FAILED=1
 
-            if [ $? -eq 0 ]; then
-              mv "output_partitions/${PART}.img.new" "output_partitions/${PART}.img"
-              echo "  ✓ Gotowe"
-            else
-              echo "  ✗ Błąd dla $PART"
-              FAILED=1
-            fi
+            mv "output_partitions/${PART}.img.new" "output_partitions/${PART}.img" 2>/dev/null || true
 
             rm -f "$NEW_DAT" "$NEW_DAT_BR"
           done
 
-          [ $FAILED -eq 0 ] || (echo "❌ Niektóre partycje nie zostały spatchowane!" && exit 1)
-          ls -lh output_partitions/
+          [ $FAILED -eq 0 ] || exit 1
 
-      # ── Skopiuj obrazy spoza dynamic partitions ─────────────────────────
-      - name: Skopiuj obrazy statyczne
+      # ── static images ───────────────────────────────────────────
+      - name: Copy static images
         run: |
           for img in boot.img dtbo.img vbmeta.img vbmeta_system.img; do
-            OTA_IMG="ota_extracted/$img"
-            BASE_IMG="base_extracted/$img"
-            if [ -f "$OTA_IMG" ]; then
-              cp "$OTA_IMG" "output_partitions/$img"
-              echo "✓ $img (z OTA)"
-            elif [ -f "$BASE_IMG" ]; then
-              cp "$BASE_IMG" "output_partitions/$img"
-              echo "  $img (z bazy)"
+            if [ -f "ota_extracted/$img" ]; then
+              cp "ota_extracted/$img" "output_partitions/"
+            elif [ -f "base_extracted/$img" ]; then
+              cp "base_extracted/$img" "output_partitions/"
             fi
           done
 
-      # ── Spakuj nowy AP tar.md5 (dynamiczna nazwa) ──────────────────────
-      - name: Spakuj AP tar.md5
+      # ── pack ────────────────────────────────────────────────────
+      - name: Pack AP tar.md5
         run: |
           mkdir -p final
-          BASE_NAME=$(basename "$(find base_fw/ -name "*.tar.md5" 2>/dev/null | head -1)" .tar.md5 2>/dev/null || echo "AP_patched")
+
+          BASE_NAME=$(find base_fw -name "*.tar.md5" | head -1 | xargs -n1 basename | sed 's/.tar.md5//')
           OUTPUT="${BASE_NAME}_patched.tar"
 
           cd output_partitions
@@ -211,11 +179,15 @@ jobs:
           md5sum -t "final/$OUTPUT" >> "final/$OUTPUT"
           mv "final/$OUTPUT" "final/${OUTPUT%.tar}.tar.md5"
 
-          ls -lh final/
-          df -h
+      # ── FIND FILE (FIX UPLOAD) ──────────────────────────────────
+      - name: Find output file
+        id: findfile
+        run: |
+          FILE=$(ls final/*.tar.md5 | head -1)
+          echo "FILE=$FILE" >> $GITHUB_OUTPUT
 
-      # ── Upload na gofile.io ──────────────────────────────────────────────
+      # ── upload ──────────────────────────────────────────────────
       - name: Upload na gofile.io
         uses: ahnafnafee/action-upload-gofile@v3.0.0
         with:
-          file: final/*.tar.md5
+          file: ${{ steps.findfile.outputs.FILE }}
