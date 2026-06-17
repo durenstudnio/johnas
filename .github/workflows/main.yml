@@ -120,19 +120,18 @@ jobs:
       # ── Zainstaluj lpunpack i simg2img ──────────────────────────────────
       - name: Zainstaluj lpunpack i simg2img
         run: |
+          # simg2img z apt – brak problemów z bibliotekami
+          sudo apt-get install -y android-sdk-libsparse-utils
+
+          # lpunpack z zewnętrznego źródła
           wget -q --header="User-Agent: Mozilla/5.0" \
             https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpunpack
           chmod +x lpunpack
           sudo mv lpunpack /usr/local/bin/
 
-          wget -q --header="User-Agent: Mozilla/5.0" \
-            https://github.com/Rprop/aosp15_partition_tools/raw/refs/heads/main/linux_glibc_x86_64/simg2img
-          chmod +x simg2img
-          sudo mv simg2img /usr/local/bin/
-
           echo "✅ Narzędzia zainstalowane:"
-          lpunpack --help 2>&1 | head -1 || echo "lpunpack OK"
-          simg2img --help 2>&1 | head -1 || echo "simg2img OK"
+          lpunpack 2>&1 | head -1 || echo "lpunpack OK"
+          simg2img 2>&1 | head -1 || echo "simg2img OK"
 
       # ── Wypakuj partycje z super.img (obsługa sparse) ───────────────────
       - name: Wypakuj partycje z super.img
