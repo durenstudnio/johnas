@@ -1,42 +1,88 @@
-name: Inspect OTA Artifact
+name: test-odm-rebuild
 
 on:
   workflow_dispatch:
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
-  inspect:
+  odm:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download OTA Artifact
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+      - name: Download OTA artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: adamwasowicz9-yansk/johnas
+          run-id: 27723007988
+          name: ota
+          path: ota
+
+      - name: Install tools
         run: |
-          mkdir -p ota
+          sudo apt update
+          sudo apt install -y unzip simg2img python3
 
-          curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -L \
-            "https://api.github.com/repos/adamwasowicz9-yansk/johnas/actions/artifacts/7709183127/zip" \
-            -o ota/artifact.zip
-
-          ls -lh ota/artifact.zip
-
-      - name: Inspect Artifact
+      - name: Extract ODM files
         run: |
-          echo "===== ZIP CONTENT ====="
-          unzip -l ota/artifact.zip
+          mkdir work
 
-      - name: Extract Artifact
+          unzip -j ota/ota.zip \
+            odm.transfer.list \
+            odm.new.dat \
+            odm.patch.dat \
+            -d work
+
+          ls -lah work
+
+      - name: Inspect transfer list
         run: |
-          mkdir extracted
-          unzip -q ota/artifact.zip -d extracted
+          echo "===== ODM TRANSFER ====="
+          cat work/odm.transfer.list
 
-          echo ""
-          echo "===== TREE ====="
-          find extracted | sort
+      - name: Create blank image
+        run: |
+          BLOCKS=$(tail -n +5 work/odm.transfer.list | \
+            tr ',' '\n' | \
+            sort -n | \
+            tail -1)
 
-          echo ""
-          echo "===== FILES ====="
-          find extracted -type f | sort
+          echo "Max block: $BLOCKS"
+
+          dd if=/dev/zero \
+             of=work/odm.img \
+             bs=4096 \
+             count=$((BLOCKS+1024))
+
+          ls -lh work/odm.img
+
+      - name: Download imgpatchtools
+        run: |
+          git clone https://github.com/erfanoabdi/imgpatchtools.git
+          cd imgpatchtools
+
+          make || true
+
+      - name: Try patch ODM
+        run: |
+          cd imgpatchtools
+
+          ./BlockImageUpdate \
+            ../work/odm.img \
+            ../work/odm.transfer.list \
+            ../work/odm.new.dat \
+            ../work/odm.patch.dat || true
+
+      - name: Check result
+        run: |
+          file work/odm.img || true
+          ls -lh work/odm.img
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: odm-test
+          path: work/*
