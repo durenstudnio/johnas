@@ -1,0 +1,96 @@
+name: Inspect OTA Artifact
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download OTA Artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: adamwasowicz9-yansk/johnas
+          run-id: 27723007988
+          name: ota
+          path: ota
+
+      - name: Show Downloaded Files
+        run: |
+          echo "===== DOWNLOADED ====="
+          find ota | sort
+
+          echo ""
+          echo "===== SIZES ====="
+          ls -lah ota
+
+      - name: Verify OTA ZIP
+        run: |
+          OTA_ZIP=$(find ota -type f -name "*.zip" | head -1)
+
+          if [ -z "$OTA_ZIP" ]; then
+            echo "❌ Nie znaleziono ZIP"
+            exit 1
+          fi
+
+          echo "OTA_ZIP=$OTA_ZIP" >> $GITHUB_ENV
+
+          echo "===== FILE ====="
+          ls -lh "$OTA_ZIP"
+
+          echo ""
+          echo "===== TYPE ====="
+          file "$OTA_ZIP"
+
+          echo ""
+          echo "===== SHA256 ====="
+          sha256sum "$OTA_ZIP"
+
+      - name: List OTA Contents
+        run: |
+          unzip -l "$OTA_ZIP" > ota_contents.txt
+
+          echo "===== FIRST 200 ====="
+          head -200 ota_contents.txt
+
+          echo ""
+          echo "===== LAST 200 ====="
+          tail -200 ota_contents.txt
+
+      - name: Search Transfer Lists
+        run: |
+          echo "===== TRANSFER LISTS ====="
+          unzip -l "$OTA_ZIP" | grep "transfer.list" || true
+
+      - name: Search NEW DAT
+        run: |
+          echo "===== NEW DAT ====="
+          unzip -l "$OTA_ZIP" | grep "new.dat" || true
+
+      - name: Search PATCH DAT
+        run: |
+          echo "===== PATCH DAT ====="
+          unzip -l "$OTA_ZIP" | grep "patch.dat" || true
+
+      - name: Search IMG Files
+        run: |
+          echo "===== IMG ====="
+          unzip -l "$OTA_ZIP" | grep "\.img$" || true
+
+      - name: Search Patches
+        run: |
+          echo "===== .P FILES ====="
+          unzip -l "$OTA_ZIP" | grep "\.p$" || true
+
+      - name: Search Dynamic Partitions
+        run: |
+          echo "===== DYNAMIC PARTITIONS ====="
+          unzip -l "$OTA_ZIP" | grep dynamic_partitions || true
+
+      - name: Upload Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ota-inspection
+          path: ota_contents.txt
