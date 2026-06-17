@@ -1,27 +1,42 @@
-name: Download OTA
+name: Inspect OTA Artifact
 
 on:
   workflow_dispatch:
 
 jobs:
-  download:
+  inspect:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download OTA from PixelDrain
+      - name: Download OTA Artifact
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p ota
 
-          curl -L \
-            "https://pixeldrain.com/api/file/pWud9sse?download" \
-            -o ota.zip
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -L \
+            "https://api.github.com/repos/adamwasowicz9-yansk/johnas/actions/artifacts/7709183127/zip" \
+            -o ota/artifact.zip
 
-          ls -lh ota.zip
+          ls -lh ota/artifact.zip
 
-      - name: Upload OTA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ota
-          path: ota.zip
-          if-no-files-found: error
-          retention-days: 7
+      - name: Inspect Artifact
+        run: |
+          echo "===== ZIP CONTENT ====="
+          unzip -l ota/artifact.zip
+
+      - name: Extract Artifact
+        run: |
+          mkdir extracted
+          unzip -q ota/artifact.zip -d extracted
+
+          echo ""
+          echo "===== TREE ====="
+          find extracted | sort
+
+          echo ""
+          echo "===== FILES ====="
+          find extracted -type f | sort
