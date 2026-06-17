@@ -1,10 +1,10 @@
-name: Inspect IMG Patch Tools
+name: Test BlockImageUpdate
 
 on:
   workflow_dispatch:
 
 jobs:
-  inspect:
+  test:
     runs-on: ubuntu-latest
 
     steps:
@@ -14,21 +14,21 @@ jobs:
             https://github.com/erfanoabdi/imgpatchtools/releases/download/0.3/IMG_Patch_Tools_0.3.zip \
             -O imgpatchtools.zip
 
-          echo "===== ZIP INFO ====="
-          ls -lh imgpatchtools.zip
-
           unzip -q imgpatchtools.zip
 
-          echo ""
-          echo "===== DIRECTORY TREE ====="
-          find . | sort
+          chmod +x IMG_Patch_Tools_0.3/Linux_x64/*
+
+      - name: Show Help
+        run: |
+          echo "===== BlockImageUpdate ====="
+          ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate || true
 
           echo ""
-          echo "===== EXECUTABLE FILES ====="
-          find . -type f -executable | sort || true
+
+          echo "===== BlockImageVerify ====="
+          ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageVerify || true
 
           echo ""
-          echo "===== FILE TYPES ====="
-          find . -type f | while read f; do
-            file "$f"
-          done
+
+          echo "===== ApplyPatch ====="
+          ./IMG_Patch_Tools_0.3/Linux_x64/ApplyPatch || true
