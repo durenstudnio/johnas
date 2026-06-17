@@ -34,7 +34,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y \
             lz4 brotli python3 python3-pip \
-            zip unzip tar pv wget curl
+            zip unzip tar pv wget curl file
           pip3 install gdown
 
       # ── Sprawdź wolne miejsce ────────────────────────────────────────────
@@ -79,12 +79,11 @@ jobs:
           ls -lh ota_extracted/
           rm ota/ota.zip
 
-      # ── Wypakuj bazowy AP tar (poprawione) ─────────────────────────────
+      # ── Wypakuj bazowy AP tar ────────────────────────────────────────────
       - name: Wypakuj AP tar
         run: |
           mkdir -p base_extracted
           cd base_extracted
-          # Usuń 33-bajtowy suffix MD5 (32 bajty + newline) i wypakuj
           head -c -33 ../base_fw/AP_base.tar.md5 | tar x
           ls -lh
           rm ../base_fw/AP_base.tar.md5
@@ -101,23 +100,46 @@ jobs:
           done
           ls -lh *.img 2>/dev/null || echo "Brak .img"
 
-      # ── lpunpack – wyciągnij partycje z super.img ──────────────────────
-      - name: Zainstaluj lpunpack (z Twojego źródła)
+      # ── Zainstaluj lpunpack i simg2img ──────────────────────────────────
+      - name: Zainstaluj lpunpack i simg2img
         run: |
+          # lpunpack z Twojego źródła
           wget -q --header="User-Agent: Mozilla/5.0" \
             https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpunpack
           chmod +x lpunpack
           sudo mv lpunpack /usr/local/bin/
-          lpunpack --help || echo "lpunpack installed"
 
+          # simg2img z Rprop/aosp15_partition_tools
+          wget -q --header="User-Agent: Mozilla/5.0" \
+            https://github.com/Rprop/aosp15_partition_tools/raw/refs/heads/main/linux_glibc_x86_64/simg2img
+          chmod +x simg2img
+          sudo mv simg2img /usr/local/bin/
+
+          echo "✅ Narzędzia zainstalowane:"
+          lpunpack --help 2>&1 | head -1 || echo "lpunpack OK"
+          simg2img --help 2>&1 | head -1 || echo "simg2img OK"
+
+      # ── Wypakuj partycje z super.img (obsługa sparse) ───────────────────
       - name: Wypakuj partycje z super.img
         run: |
           mkdir -p partitions
+
           if [ -f base_extracted/super.img ]; then
-            lpunpack base_extracted/super.img partitions/
+            echo "🔍 Sprawdzam czy super.img jest sparse..."
+            if file base_extracted/super.img | grep -q "Android sparse image"; then
+              echo "📦 super.img jest w formacie sparse – konwertuję do raw..."
+              simg2img base_extracted/super.img base_extracted/super_raw.img
+              echo "✅ Konwersja zakończona"
+              echo "📂 Wypakowuję partycje z super_raw.img..."
+              lpunpack base_extracted/super_raw.img partitions/
+              rm base_extracted/super_raw.img
+            else
+              echo "📂 super.img jest już w formacie raw – wypakowuję..."
+              lpunpack base_extracted/super.img partitions/
+            fi
             ls -lh partitions/
           else
-            echo "Brak super.img – kopiuję osobne obrazy"
+            echo "⚠️ Brak super.img – kopiuję osobne obrazy"
             cp base_extracted/*.img partitions/ 2>/dev/null || true
           fi
 
@@ -212,6 +234,14 @@ jobs:
 
           ls -lh final/
           df -h
+
+      # ── Upload do GitHub Artifacts (zapas) ──────────────────────────────
+      - name: Upload AP tar.md5 do Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AP_patched
+          path: final/*.tar.md5
+          retention-days: 7
 
       # ── Upload na gofile.io ──────────────────────────────────────────────
       - name: Upload na gofile.io
