@@ -1,4 +1,4 @@
-name: urboss
+name: ffurboss
 
 on:
   workflow_dispatch:
