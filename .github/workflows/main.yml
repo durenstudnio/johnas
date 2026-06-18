@@ -92,13 +92,11 @@ jobs:
       - name: Wypakuj AP z artefaktu (obsługa tar.md5)
         run: |
           mkdir -p base_extracted
-          # Szukamy pliku .tar.md5 (typowe dla firmware Samsung)
           TARFILE=$(find base_fw -name "*.tar.md5" | head -1)
           if [ -n "$TARFILE" ]; then
             echo "Znaleziono AP jako tar.md5: $TARFILE"
             head -c -33 "$TARFILE" | tar -x -C base_extracted/
           else
-            # Jeśli nie ma tar.md5, może być zwykły .tar
             TARFILE=$(find base_fw -name "*.tar" | head -1)
             if [ -n "$TARFILE" ]; then
               echo "Znaleziono AP jako .tar: $TARFILE"
@@ -106,7 +104,6 @@ jobs:
             fi
           fi
 
-          # Kopiujemy wszystkie .lz4 i .img (jeśli jakieś są) do głównego folderu
           find base_extracted -name "*.lz4" -exec cp {} base_extracted/ \; 2>/dev/null || true
           find base_extracted -name "*.img" -exec cp {} base_extracted/ \; 2>/dev/null || true
 
@@ -138,7 +135,6 @@ jobs:
         run: |
           mkdir -p partitions
           
-          # Szukamy super.img w podkatalogach, na wypadek gdyby struktura w zip była głęboka
           SUPER_PATH=$(find base_extracted -name "super.img" | head -1)
           
           if [ -z "$SUPER_PATH" ]; then
@@ -202,16 +198,15 @@ jobs:
             fi
           done
 
-      # ── Rekonstrukcja SUPER (tylko partycje z dynamic_partitions_op_list) ──
+      # ── Rekonstrukcja SUPER (Dynamiczne obliczanie rozmiarów) ─────────────
       - name: Przebudowa dynamicznego obrazu SUPER
         run: |
           mkdir -p final_partitions
           mkdir -p super_input
           
-          # Kopiujemy wszystkie obrazy z partitions do super_input (potem odfiltrujemy)
           cp partitions/*.img super_input/ 2>/dev/null || true
 
-          echo "=== Dynamiczne generowanie argumentów lpmake (filtrowanie po op_list) ==="
+          echo "=== Dynamiczne generowanie argumentów lpmake ==="
           python3 -c '
           import os
           import math
@@ -220,44 +215,45 @@ jobs:
           parts_dir = "super_input"
           output_img = "final_partitions/super.img"
 
-          # Rozmiary dla serii S22 (S901E) – dostosuj jeśli potrzeba
+          # Maksymalne dopuszczalne limity pamięci super dla urządzenia
           SUPER_SIZE = 9126809600
           GROUP_SIZE = 9122611200
 
           def align_to_block(size):
               return int(math.ceil(size / 4096.0) * 4096)
 
-          # Wczytaj nazwy partycji z op_list (linie "resize <name> <size>")
+          # Wczytujemy z op_list tylko nazwy partycji, które muszą trafić do super
           part_names = set()
-          sizes = {}
           if os.path.exists(op_list):
               with open(op_list, "r") as f:
                   for line in f:
                       line = line.strip()
                       if line.startswith("resize "):
                           parts = line.split()
-                          if len(parts) >= 3:
-                              name = parts[1]
-                              size = int(parts[2])
-                              sizes[name] = size
-                              part_names.add(name)
+                          if len(parts) >= 2:
+                              part_names.add(parts[1])
 
+          # Bazowa komenda lpmake (z dodaną flagą --sparse na końcu)
           cmd = f"lpmake --metadata-size 65536 --super-name super --metadata-slots 2 " \
                 f"--device super:{SUPER_SIZE} --group qti_dynamic_partitions:{GROUP_SIZE}"
 
-          # Dodajemy tylko te partycje, które są wymienione w op_list
+          # Obliczanie realnych rozmiarów plików .img na dysku
           for file in os.listdir(parts_dir):
               if file.endswith(".img"):
                   part_name = file[:-4]
+                  
                   if part_name not in part_names:
                       print(f"Pomijam {part_name} – brak wpisu w dynamic_partitions_op_list")
                       continue
-                  raw_size = sizes.get(part_name, os.path.getsize(os.path.join(parts_dir, file)))
+                  
+                  img_path = os.path.join(parts_dir, file)
+                  raw_size = os.path.getsize(img_path)
                   part_size = align_to_block(raw_size)
+                  
                   cmd += f" --partition {part_name}:none:{part_size}:qti_dynamic_partitions"
-                  cmd += f" --image {part_name}={os.path.join(parts_dir, file)}"
+                  cmd += f" --image {part_name}={img_path}"
 
-          cmd += f" --output {output_img}"
+          cmd += f" --sparse --output {output_img}"
 
           with open("lpmake_cmd.sh", "w") as out:
               out.write(cmd + "\n")
@@ -267,19 +263,19 @@ jobs:
           cat lpmake_cmd.sh
           
           echo "=== Uruchamianie rekonstrukcji super.img ==="
-          bash lpmake_cmd.sh
+          bash lpmake_cmd.sh 2>&1
           
           if [ -f "final_partitions/super.img" ]; then
             echo "✓ super.img został pomyślnie odbudowany!"
             ls -lh final_partitions/super.img
           else
-            echo "BŁĄD: lpmake nie utworzył pliku super.img!" && exit 1
+            echo "BŁĄD: lpmake nie utworzył pliku super.img!"
+            exit 1
           fi
 
       # ── Kopiowanie statycznych obrazów i CSC (Na zewnątrz super) ─────────
       - name: Skopiuj obrazy statyczne spoza super
         run: |
-          # Zbieramy obrazy z ota, bazy i naszego folderu extra_partitions (CSC)
           for img in boot.img dtbo.img vbmeta.img vbmeta_system.img init_boot.img vendor_boot.img vm-bootsys.img prism.img optics.img; do
             OTA_IMG="ota_extracted/$img"
             EXTRA_IMG="extra_partitions/$img"
@@ -309,20 +305,31 @@ jobs:
             BASE_NAME="AP_Patched_Firmware"
           fi
           
-          OUTPUT="${BASE_NAME}_patched.tar"
+          OUTPUT_TAR="${BASE_NAME}_patched.tar"
           
-          echo "Pakowanie obrazów do: $OUTPUT"
+          echo "=== Wolne miejsce przed pakowaniem ==="
+          df -h /
+          
+          echo "Pakowanie obrazów do: final_output/$OUTPUT_TAR"
           cd final_partitions
-          
-          tar -c *.img -f "../final_output/$OUTPUT"
+          tar -cf "../final_output/$OUTPUT_TAR" *.img
           cd ..
           
-          echo "Generowanie sumy kontrolnej MD5..."
-          md5sum -t "final_output/$OUTPUT" >> "final_output/$OUTPUT"
-          mv "final_output/$OUTPUT" "final_output/${OUTPUT%.tar}.tar.md5"
+          echo "=== Wolne miejsce po utworzeniu TAR ==="
+          df -h /
+          
+          # Czyszczenie katalogów roboczych w celu zwolnienia miejsca na dysku
+          echo "Czyszczenie pozostałości w celu odzyskania miejsca..."
+          rm -rf final_partitions base_fw ota ota_extracted base_extracted csc_fw csc_extracted extra_partitions partitions super_input
+          
+          echo "Generowanie sumy kontrolnej MD5 dla Odina..."
+          cd final_output
+          md5sum -b "$OUTPUT_TAR" >> "$OUTPUT_TAR"
+          mv "$OUTPUT_TAR" "${OUTPUT_TAR}.md5"
           
           echo "=== Zawartość folderu wyjściowego ==="
-          ls -lh final_output/
+          ls -lh ./
+          cd ..
 
       # ── Upload do GitHub Artifacts (Zapas) ──────────────────────────────
       - name: Upload AP tar.md5 do Artifacts
