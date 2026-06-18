@@ -1,0 +1,108 @@
+name: Fix System & Product Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "Link do ZIP zawierającego system.img i product.img"
+        required: true
+
+jobs:
+  fix-images:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            android-sdk-libsparse-utils \
+            e2fsprogs \
+            unzip
+
+      - name: Download ROM ZIP
+        run: |
+          wget "${{ github.event.inputs.zip_url }}" -O rom.zip
+
+      - name: Extract ZIP
+        run: |
+          mkdir extracted
+          unzip -o rom.zip -d extracted
+
+          SYSTEM_IMG=$(find extracted -type f -iname "system.img" | head -n1)
+          PRODUCT_IMG=$(find extracted -type f -iname "product.img" | head -n1)
+
+          if [ -z "$SYSTEM_IMG" ]; then
+            echo "system.img not found"
+            exit 1
+          fi
+
+          if [ -z "$PRODUCT_IMG" ]; then
+            echo "product.img not found"
+            exit 1
+          fi
+
+          cp "$SYSTEM_IMG" system.img
+          cp "$PRODUCT_IMG" product.img
+
+          ls -lh system.img product.img
+
+      - name: Fix images
+        run: |
+          fix_image() {
+            local input="$1"
+            local output="$2"
+            local mountdir="$3"
+
+            echo "Processing $input"
+
+            rm -f raw.img
+
+            if file "$input" | grep -q "Android sparse image"; then
+              simg2img "$input" raw.img
+            else
+              cp "$input" raw.img
+            fi
+
+            mkdir -p "$mountdir"
+
+            sudo mount -o loop,rw raw.img "$mountdir"
+
+            if [ -d "$mountdir/system" ] && [ -f "$mountdir/system/build.prop" ]; then
+              echo "Flattening nested system directory"
+              sudo cp -a "$mountdir/system/." "$mountdir/"
+              sudo rm -rf "$mountdir/system"
+            fi
+
+            for f in product vendor system_ext; do
+              if [ -f "$mountdir/$f" ] && [ ! -s "$mountdir/$f" ]; then
+                sudo rm -f "$mountdir/$f"
+              fi
+            done
+
+            if [ -f "$mountdir/vendor/etc/fstab.qcom" ]; then
+              sudo sed -i 's/^.*system_ext.*$/#&/' "$mountdir/vendor/etc/fstab.qcom"
+            fi
+
+            sync
+
+            sudo umount "$mountdir"
+
+            img2simg raw.img "$output"
+
+            echo "$output created"
+          }
+
+          fix_image system.img system-fixed.img /mnt/system
+          fix_image product.img product-fixed.img /mnt/product
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-images
+          path: |
+            system-fixed.img
+            product-fixed.img
