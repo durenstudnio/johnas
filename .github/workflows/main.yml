@@ -10,6 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── Zwolnienie miejsca na dysku ─────────────────────────────────────
       - name: Free disk space
         run: |
           echo "Before:"
@@ -26,6 +27,7 @@ jobs:
           echo "After:"
           df -h /
 
+      # ── Pobieranie oprogramowania i artefaktów ──────────────────────────
       - name: Download AP artifact
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
@@ -56,9 +58,11 @@ jobs:
           wget -q "https://github.com/adamwasowicz9-yansk/johnas/releases/download/v69/m1v7kv.zip" -O m1v7kv.zip
           unzip -q m1v7kv.zip -d csc_fw
 
+      # ── Instalacja zależności systemowych ───────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update
+          # android-sdk-libsparse-utils zastępuje problematyczny pakiet simg2img
           sudo apt-get install -y unzip zip lz4 wget file android-sdk-libsparse-utils python3
           
           # Stabilny link do OpenSSL 1.0 dla BlockImageUpdate
@@ -66,7 +70,7 @@ jobs:
           sudo dpkg -i libssl1.0.0_*.deb || true
           sudo ldconfig
 
-          # Pobranie binariów lpunpack i lpmake z mirrora (wersja RAW)
+          # Pobranie binariów lpunpack i lpmake z mirrora
           wget -q -O lpunpack https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpunpack
           wget -q -O lpmake https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpmake
           
@@ -79,18 +83,20 @@ jobs:
           unzip -q IMG_Patch_Tools_0.3.zip
           chmod +x IMG_Patch_Tools_0.3/Linux_x64/*
 
+      # ── Ekstrakcja paczek ───────────────────────────────────────────────
       - name: Extract OTA
         run: |
           mkdir ota_extracted
           OTAFILE=$(find ota -type f | head -1)
           unzip -q "$OTAFILE" -d ota_extracted
 
-      - name: Extract AP
+      - name: Wypakuj AP tar
         run: |
-          mkdir base_extracted
+          mkdir -p base_extracted
           cd base_extracted
           APFILE=$(find ../base_fw -name "*.tar.md5" | head -1)
           head -c -33 "$APFILE" | tar xf -
+          ls -lh
 
       - name: Extract CSC
         run: |
@@ -99,11 +105,25 @@ jobs:
           CSCFILE=$(find ../csc_fw -name "*.tar.md5" | head -1)
           head -c -33 "$CSCFILE" | tar xf -
 
+      # ── Twoja autorska pętla dekompresji lz4 dla bazy AP ─────────────────
+      - name: Zdekompresuj obrazy lz4
+        run: |
+          cd base_extracted
+          for f in *.lz4; do
+            [ -f "$f" ] || continue
+            echo "Dekompresuję: $f"
+            lz4 -d "$f" "${f%.lz4}"
+            rm "$f"
+          done
+          echo "=== Rozpakowane obrazy bazy ==="
+          ls -lh *.img 2>/dev/null || echo "Brak .img"
+
+      # ── Rozbijanie kontenera super.img na podobrazy ──────────────────────
       - name: Unpack super.img to get sub-images
         run: |
           mkdir -p partitions
           
-          # Sprawdzenie czy super.img to obraz rzadki (sparse) i konwersja jeśli trzeba
+          # Plik super.img jest już czystym obrazem dzięki pętli lz4
           if file base_extracted/super.img | grep -q "Android sparse image"; then
             echo "Converting sparse super.img to raw..."
             simg2img base_extracted/super.img base_extracted/super_raw.img
@@ -115,12 +135,11 @@ jobs:
           echo "===== Extracted partitions from super ====="
           ls -lh partitions/
 
+      # ── Przygotowanie obrazów CSC i Extra ────────────────────────────────
       - name: Prepare CSC and Extra partitions
         run: |
-          # 1. Dekompresja vm-bootsys
-          if [ -f base_extracted/vm-bootsys.img.lz4 ]; then
-            lz4 -d base_extracted/vm-bootsys.img.lz4 partitions/vm-bootsys.img
-          elif [ -f base_extracted/vm-bootsys.img ]; then
+          # 1. Przeniesienie vm-bootsys (odkodowanego z bazy w kroku lz4)
+          if [ -f base_extracted/vm-bootsys.img ]; then
             cp base_extracted/vm-bootsys.img partitions/
           fi
 
@@ -139,22 +158,20 @@ jobs:
           echo "===== Partitions ready for patching ====="
           ls -lh partitions/
 
+      # ── Łatanie partycji dynamicznych przez BlockImageUpdate ─────────────
       - name: Patch ALL dynamic partitions
         run: |
           echo "===== STARTING AUTOMATIC LOOP PATCHING ====="
           
-          # Pętla lecąca po wszystkich listach transferowych znalezionych w OTA
           for list in ota_extracted/*.transfer.list; do
             [ -e "$list" ] || continue
             
-            # Wyciąganie czystej nazwy partycji
             part_name=$(basename "$list" .transfer.list)
             
             echo "--------------------------------------------------"
             echo "Processing partition: $part_name"
             echo "--------------------------------------------------"
             
-            # Sprawdzenie czy mamy pasujący plik bazowy .img
             if [ -f "partitions/${part_name}.img" ]; then
               ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
                 "partitions/${part_name}.img" \
@@ -171,7 +188,7 @@ jobs:
           echo "===== Patched Files Size ====="
           ls -lh partitions/
 
-      # ── WBUDOWANY I NIEZALEŻNY AUTOMAT LPMAKE (ZAMIAST SKRYPTU Z 404) ───
+      # ── Przebudowa kontenera SUPER (Z wyrównaniem do bloków 4096) ────────
       - name: Przebudowa dynamicznego obrazu SUPER
         run: |
           mkdir -p final_partitions
@@ -179,16 +196,20 @@ jobs:
           echo "=== Generowanie argumentów lpmake za pomocą wbudowanego skryptu Python ==="
           python3 -c '
           import os
+          import math
 
           op_list = "ota_extracted/dynamic_partitions_op_list"
           parts_dir = "partitions"
           output_img = "final_partitions/super.img"
 
-          # Stałe wartości geometrii super dla Samsunga Galaxy S22 5G (r0q)
-          SUPER_SIZE = 9126805504
+          # Właściwa geometria dla S22 (r0q) podzielna przez 4096
+          SUPER_SIZE = 9126809600
           GROUP_SIZE = 9122611200
 
-          # Słownik przechowujący docelowe rozmiary partycji wyciągnięte z pliku op_list
+          # Matematyczne wyrównanie rozmiaru w górę do bloku 4096
+          def align_to_block(size):
+              return int(math.ceil(size / 4096.0) * 4096)
+
           sizes = {}
 
           if os.path.exists(op_list):
@@ -198,25 +219,23 @@ jobs:
                       if line.startswith("resize "):
                           parts = line.split()
                           if len(parts) >= 3:
-                              sizes[parts[1]] = parts[2]
+                              sizes[parts[1]] = int(parts[2])
 
-          # Budujemy bazową komendę lpmake
           cmd = f"lpmake --metadata-size 65536 --super-name super --metadata-slots 2 " \
                 f"--device super:{SUPER_SIZE} --group qti_dynamic_partitions:{GROUP_SIZE}"
 
-          # Dodajemy każdą partycję, która fizycznie istnieje w folderze partitions/
           for file in os.listdir(parts_dir):
               if file.endswith(".img"):
                   part_name = file[:-4]
-                  # Jeśli ota podaje nowy rozmiar, bierzemy go. Jeśli nie, sprawdzamy rozmiar pliku na dysku.
-                  part_size = sizes.get(part_name, os.path.getsize(os.path.join(parts_dir, file)))
+                  
+                  raw_size = sizes.get(part_name, os.path.getsize(os.path.join(parts_dir, file)))
+                  part_size = align_to_block(raw_size)
                   
                   cmd += f" --partition {part_name}:none:{part_size}:qti_dynamic_partitions"
                   cmd += f" --image {part_name}={os.path.join(parts_dir, file)}"
 
           cmd += f" --output {output_img}"
 
-          # Zapisujemy wygenerowaną komendę do skryptu powłoki
           with open("lpmake_cmd.sh", "w") as out:
               out.write(cmd + "\n")
           '
@@ -234,7 +253,7 @@ jobs:
             echo "BŁĄD: Wbudowany generator lpmake nie utworzył pliku super.img!" && exit 1
           fi
 
-      # ── Kopiowanie statycznych obrazów i przygotowanie AP pod Odina ───────
+      # ── Kopiowanie statycznych obrazów pod finalny tar ──────────────────
       - name: Skopiuj obrazy statyczne spoza super
         run: |
           for img in boot.img dtbo.img vbmeta.img vbmeta_system.img init_boot.img vendor_boot.img vm-bootsys.img; do
@@ -245,7 +264,7 @@ jobs:
               echo "✓ $img (zastąpiono z OTA)"
             elif [ -f "$BASE_IMG" ]; then
               cp "$BASE_IMG" "final_partitions/$img"
-              echo "  $img (zachowano z bazy)"
+              echo "  $img (zachowano z odkodowanej bazy)"
             fi
           done
 
@@ -254,18 +273,15 @@ jobs:
         run: |
           mkdir -p final_output
           
-          # Wyciągnięcie oryginalnej nazwy pliku AP
-          BASE_NAME=$(basename "$(find base_fw -name "AP_*.tar.md5" 2>/dev/null | head -1)" .tar.md5 2>/dev/null || echo "AP_Patched_Firmware")
+          BASE_NAME=$(basename "$(find base_fw -name "*.tar.md5" 2>/dev/null | head -1)" .tar.md5 2>/dev/null || echo "AP_Patched_Firmware")
           OUTPUT="${BASE_NAME}_patched.tar"
           
           echo "Pakowanie obrazów do: $OUTPUT"
           cd final_partitions
           
-          # Standardowe pakowanie tar (Zoptymalizowane pod Odina)
           tar -c *.img -f "../final_output/$OUTPUT"
           cd ..
           
-          # Doklejenie sumy kontrolnej MD5 na koniec archiwum - wymóg Odina
           echo "Generowanie sumy kontrolnej MD5..."
           md5sum -t "final_output/$OUTPUT" >> "final_output/$OUTPUT"
           mv "final_output/$OUTPUT" "final_output/${OUTPUT%.tar}.tar.md5"
