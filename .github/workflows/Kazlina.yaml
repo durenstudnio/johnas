@@ -69,7 +69,8 @@ jobs:
             wget \
             file
 
-          wget -q http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.0.0_1.0.2n-1ubuntu5.13_amd64.deb
+          # Pobranie bezpośrednio z bazy Launchpada (omija błędy 404 serwerów lustrzanych Azure)
+          wget -q https://launchpad.net/ubuntu/+archive/primary/+files/libssl1.0.0_1.0.2n-1ubuntu5.13_amd64.deb
 
           sudo dpkg -i libssl1.0.0_*.deb || true
 
