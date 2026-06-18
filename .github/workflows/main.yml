@@ -64,13 +64,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip zip lz4 wget file android-sdk-libsparse-utils python3
           
-          # Pobieranie sprawdzonej paczki libssl z Twojego repo
           echo "Pobieranie libssl1.0.0..."
           wget -nv https://github.com/danjekb/tools/raw/refs/heads/main/libssl1.0.0_1.0.2g-1ubuntu4.20_amd64.deb
           sudo dpkg -i libssl1.0.0_*.deb || true
           sudo ldconfig
 
-          # Poprawne linki raw do binariów lpunpack i lpmake
           echo "Pobieranie lpunpack i lpmake..."
           wget -nv -O lpunpack https://raw.githubusercontent.com/whyshhnuv/lpunpack-lpmake-mirror/Linux-debian/binary/lpunpack
           wget -nv -O lpmake https://raw.githubusercontent.com/whyshhnuv/lpunpack-lpmake-mirror/Linux-debian/binary/lpmake
@@ -94,8 +92,10 @@ jobs:
       - name: Wypakuj AP z artefaktu
         run: |
           mkdir -p base_extracted
+          # Kopiujemy lz4 oraz gotowe pliki img, jeśli istnieją w zipie
           find base_fw -name "*.lz4" -exec cp {} base_extracted/ \;
-          echo "=== Zawartość folderu bazowego po spłaszczeniu struktury ==="
+          find base_fw -name "*.img" -exec cp {} base_extracted/ \;
+          echo "=== Zawartość folderu bazowego po ekstrakcji ==="
           ls -lh base_extracted/
 
       - name: Extract CSC
@@ -123,36 +123,47 @@ jobs:
         run: |
           mkdir -p partitions
           
-          if file base_extracted/super.img | grep -q "Android sparse image"; then
+          # Szukamy super.img w podkatalogach, na wypadek gdyby struktura w zip była głęboka
+          SUPER_PATH=$(find base_extracted -name "super.img" | head -1)
+          
+          if [ -z "$SUPER_PATH" ]; then
+            echo "BŁĄD: Nie znaleziono pliku super.img w base_extracted!"
+            ls -R base_extracted
+            exit 1
+          fi
+
+          if file "$SUPER_PATH" | grep -q "Android sparse image"; then
             echo "Converting sparse super.img to raw..."
-            simg2img base_extracted/super.img base_extracted/super_raw.img
+            simg2img "$SUPER_PATH" base_extracted/super_raw.img
             lpunpack base_extracted/super_raw.img partitions/
           else
-            lpunpack base_extracted/super.img partitions/
+            lpunpack "$SUPER_PATH" partitions/
           fi
           
           echo "===== Extracted partitions from super ====="
           ls -lh partitions/
 
-      # ── Przygotowanie obrazów CSC i Extra ────────────────────────────────
+      # ── Przygotowanie obrazów CSC i Extra (Z dala od folderu 'partitions') ──
       - name: Prepare CSC and Extra partitions
         run: |
+          mkdir -p extra_partitions
+          
           if [ -f base_extracted/vm-bootsys.img ]; then
-            cp base_extracted/vm-bootsys.img partitions/
+            cp base_extracted/vm-bootsys.img extra_partitions/
           fi
 
           if [ -f csc_extracted/prism.img.lz4 ]; then
             echo "Decompressing prism.img.lz4 from CSC..."
-            lz4 -d csc_extracted/prism.img.lz4 partitions/prism.img
+            lz4 -d csc_extracted/prism.img.lz4 extra_partitions/prism.img
           fi
 
           if [ -f csc_extracted/optics.img.lz4 ]; then
             echo "Decompressing optics.img.lz4 from CSC..."
-            lz4 -d csc_extracted/optics.img.lz4 partitions/optics.img
+            lz4 -d csc_extracted/optics.img.lz4 extra_partitions/optics.img
           fi
 
-          echo "===== Partitions ready for patching ====="
-          ls -lh partitions/
+          echo "===== Extra/CSC Partitions ready ====="
+          ls -lh extra_partitions/
 
       # ── Łatanie partycji dynamicznych przez BlockImageUpdate ─────────────
       - name: Patch ALL dynamic partitions
@@ -161,12 +172,9 @@ jobs:
           
           for list in ota_extracted/*.transfer.list; do
             [ -e "$list" ] || continue
-            
             part_name=$(basename "$list" .transfer.list)
             
-            echo "--------------------------------------------------"
             echo "Processing partition: $part_name"
-            echo "--------------------------------------------------"
             
             if [ -f "partitions/${part_name}.img" ]; then
               ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
@@ -179,35 +187,34 @@ jobs:
             fi
           done
 
-      - name: Verify Result
-        run: |
-          echo "===== Patched Files Size ====="
-          ls -lh partitions/
-
-      # ── Rekonstrukcja SUPER (Bez śmieci z czarnej listy, oryginalna geometria) ───
+      # ── Rekonstrukcja SUPER (Automatyczne wykrywanie geometrii i blokada przepełnienia) ───
       - name: Przebudowa dynamicznego obrazu SUPER
         run: |
           mkdir -p final_partitions
+          mkdir -p super_input
           
-          echo "=== Generowanie argumentów lpmake za pomocą wbudowanego skryptu Python ==="
+          # Przenosimy do dedykowanego folderu TYLKO te obrazy, które oryginalnie były w super
+          # Zapobiega to doklejaniu prism, optics i vm-bootsys do grupy qti_dynamic_partitions
+          cp partitions/*.img super_input/
+          rm -f super_input/prism.img super_input/optics.img super_input/vm-bootsys.img 2>/dev/null || true
+
+          echo "=== Dynamiczne generowanie argumentów lpmake ==="
           python3 -c '
           import os
           import math
 
           op_list = "ota_extracted/dynamic_partitions_op_list"
-          parts_dir = "partitions"
+          parts_dir = "super_input"
           output_img = "final_partitions/super.img"
 
+          # Rozmiary dla serii S22 (S901E) pobrane bezpośrednio z Twojego logu lpmake
           SUPER_SIZE = 9126809600
           GROUP_SIZE = 9122611200
-
-          blacklist = ["prism", "optics", "vm-bootsys"]
 
           def align_to_block(size):
               return int(math.ceil(size / 4096.0) * 4096)
 
           sizes = {}
-
           if os.path.exists(op_list):
               with open(op_list, "r") as f:
                   for line in f:
@@ -223,11 +230,6 @@ jobs:
           for file in os.listdir(parts_dir):
               if file.endswith(".img"):
                   part_name = file[:-4]
-                  
-                  if part_name in blacklist:
-                      print(f"Skipping blacklisted partition from super: {part_name}")
-                      continue
-                  
                   raw_size = sizes.get(part_name, os.path.getsize(os.path.join(parts_dir, file)))
                   part_size = align_to_block(raw_size)
                   
@@ -247,26 +249,27 @@ jobs:
           bash lpmake_cmd.sh
           
           if [ -f "final_partitions/super.img" ]; then
-            echo "✓ super.img został pomyślnie i perfekcyjnie odbudowany bez śmieci!"
+            echo "✓ super.img został pomyślnie odbudowany!"
             ls -lh final_partitions/super.img
           else
-            echo "BŁĄD: Wbudowany generator lpmake nie utworzył pliku super.img!" && exit 1
+            echo "BŁĄD: lpmake nie utworzył pliku super.img!" && exit 1
           fi
 
       # ── Kopiowanie statycznych obrazów i CSC (Na zewnątrz super) ─────────
       - name: Skopiuj obrazy statyczne spoza super
         run: |
+          # Zbieramy obrazy z ota, bazy i naszego folderu extra_partitions (CSC)
           for img in boot.img dtbo.img vbmeta.img vbmeta_system.img init_boot.img vendor_boot.img vm-bootsys.img prism.img optics.img; do
             OTA_IMG="ota_extracted/$img"
-            PART_IMG="partitions/$img"
+            EXTRA_IMG="extra_partitions/$img"
             BASE_IMG="base_extracted/$img"
             
             if [ -f "$OTA_IMG" ]; then
               cp "$OTA_IMG" "final_partitions/$img"
               echo "✓ $img (zastąpiono nowym z OTA)"
-            elif [ -f "$PART_IMG" ]; then
-              cp "$PART_IMG" "final_partitions/$img"
-              echo "✓ $img (skopiowano spatchowany/CSC z folderu roboczego partitions)"
+            elif [ -f "$EXTRA_IMG" ]; then
+              cp "$EXTRA_IMG" "final_partitions/$img"
+              echo "✓ $img (skopiowano z folderu extra/CSC)"
             elif [ -f "$BASE_IMG" ]; then
               cp "$BASE_IMG" "final_partitions/$img"
               echo "  $img (zachowano oryginalny z bazy)"
