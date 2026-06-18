@@ -27,9 +27,11 @@ jobs:
           mkdir -p output
 
           URL="${{ github.event.inputs.gdrive_url }}"
+          FILE_ID=$(echo "$URL" | grep -oP '(?<=/d/)[^/]+')
 
+          echo "File ID: $FILE_ID"
           echo "Downloading..."
-          gdown --fuzzy --continue "$URL" -O output/downloaded_file
+          gdown "$FILE_ID" -O output/downloaded_file --continue
 
           echo "Downloaded files:"
           ls -lah output
