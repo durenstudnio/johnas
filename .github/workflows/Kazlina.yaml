@@ -1,0 +1,102 @@
+name: Test vm-bootsys Patch
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download AP artifact
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          mkdir -p base_fw
+
+          curl -L \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -o ap.zip \
+            "https://api.github.com/repos/adamwasowicz9-yansk/urban-winner/actions/artifacts/7705052240/zip"
+
+          unzip -q ap.zip -d base_fw
+
+      - name: Download OTA artifact
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          mkdir -p ota
+
+          curl -L \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -o ota.zip \
+            "https://api.github.com/repos/adamwasowicz9-yansk/johnas/actions/artifacts/7709183127/zip"
+
+          unzip -q ota.zip -d ota
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip lz4 wget
+
+      - name: Download IMG Patch Tools
+        run: |
+          wget -q \
+            https://github.com/erfanoabdi/imgpatchtools/releases/download/0.3/IMG_Patch_Tools_0.3.zip
+
+          unzip -q IMG_Patch_Tools_0.3.zip
+
+          chmod +x IMG_Patch_Tools_0.3/Linux_x64/*
+
+      - name: Extract OTA
+        run: |
+          mkdir ota_extracted
+
+          OTAFILE=$(find ota -type f | head -1)
+
+          unzip -q "$OTAFILE" -d ota_extracted
+
+      - name: Extract AP
+        run: |
+          mkdir base_extracted
+          cd base_extracted
+
+          APFILE=$(find ../base_fw -name "*.tar.md5" | head -1)
+
+          head -c -33 "$APFILE" | tar xf -
+
+      - name: Decompress vm-bootsys
+        run: |
+          cd base_extracted
+
+          if [ -f vm-bootsys.img.lz4 ]; then
+            lz4 -d vm-bootsys.img.lz4 vm-bootsys.img
+          fi
+
+          ls -lh vm-bootsys.img
+
+      - name: Patch vm-bootsys
+        run: |
+          cp base_extracted/vm-bootsys.img .
+
+          IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
+            vm-bootsys.img \
+            ota_extracted/vm-bootsys.transfer.list \
+            ota_extracted/vm-bootsys.new.dat \
+            ota_extracted/vm-bootsys.patch.dat
+
+      - name: Verify result
+        run: |
+          file vm-bootsys.img
+          sha1sum vm-bootsys.img
+          ls -lh vm-bootsys.img
+
+      - name: Upload patched image
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-bootsys-patched
+          path: vm-bootsys.img
