@@ -1,4 +1,4 @@
-name: Test vm-bootsys Patch
+name: Full Firmware OTA Patch (with SUPER reconstruction)
 
 on:
   workflow_dispatch:
@@ -10,11 +10,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── Zwolnienie miejsca na dysku ─────────────────────────────────────
       - name: Free disk space
         run: |
           echo "Before:"
           df -h /
-
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -22,26 +22,22 @@ jobs:
             /opt/hostedtoolcache/CodeQL \
             /usr/local/share/boost \
             "$AGENT_TOOLSDIRECTORY"
-
           sudo apt-get clean
-
           docker rmi $(docker images -q) 2>/dev/null || true
-
           echo "After:"
           df -h /
 
+      # ── Pobieranie oprogramowania i artefaktów ──────────────────────────
       - name: Download AP artifact
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p base_fw
-
           curl -L \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
             -o ap.zip \
             "https://api.github.com/repos/durenstudnio/urban-winner/actions/artifacts/7705052240/zip"
-
           unzip -q ap.zip -d base_fw
 
       - name: Download OTA artifact
@@ -49,108 +45,357 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p ota
-
           curl -L \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
             -o ota.zip \
             "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7709183127/zip"
-
           unzip -q ota.zip -d ota
 
+      - name: Download CSC package
+        run: |
+          mkdir -p csc_fw
+          wget -nv "https://github.com/adamwasowicz9-yansk/johnas/releases/download/v69/m1v7kv.zip" -O m1v7kv.zip
+          unzip -q m1v7kv.zip -d csc_fw
+
+      # ── Instalacja dependencies systemowych ─────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update
-
-          sudo apt-get install -y \
-            unzip \
-            zip \
-            lz4 \
-            wget \
-            file
-
-          # Pobranie bezpośrednio z bazy Launchpada (omija błędy 404 serwerów lustrzanych Azure)
-          wget -q https://launchpad.net/ubuntu/+archive/primary/+files/libssl1.0.0_1.0.2n-1ubuntu5.13_amd64.deb
-
+          sudo apt-get install -y unzip zip lz4 wget file android-sdk-libsparse-utils python3
+          
+          echo "Pobieranie libssl1.0.0..."
+          wget -nv https://github.com/danjekb/tools/raw/refs/heads/main/libssl1.0.0_1.0.2g-1ubuntu4.20_amd64.deb
           sudo dpkg -i libssl1.0.0_*.deb || true
-
           sudo ldconfig
 
-          echo "===== OpenSSL ====="
-          ls -l /usr/lib/x86_64-linux-gnu/libcrypto* || true
-          ls -l /usr/lib/x86_64-linux-gnu/libssl* || true
+          echo "Pobieranie lpunpack i lpmake..."
+          wget -nv -O lpunpack https://raw.githubusercontent.com/whyshhnuv/lpunpack-lpmake-mirror/Linux-debian/binary/lpunpack
+          wget -nv -O lpmake https://raw.githubusercontent.com/whyshhnuv/lpunpack-lpmake-mirror/Linux-debian/binary/lpmake
+          
+          chmod +x lpunpack lpmake
+          sudo cp lpunpack lpmake /usr/local/bin/
 
       - name: Download IMG Patch Tools
         run: |
-          wget -q \
-            https://github.com/erfanoabdi/imgpatchtools/releases/download/0.3/IMG_Patch_Tools_0.3.zip
-
+          wget -nv https://github.com/erfanoabdi/imgpatchtools/releases/download/0.3/IMG_Patch_Tools_0.3.zip
           unzip -q IMG_Patch_Tools_0.3.zip
-
           chmod +x IMG_Patch_Tools_0.3/Linux_x64/*
 
-      - name: Check IMG Patch Tools dependencies
-        run: |
-          ldd IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate || true
-
+      # ── Ekstrakcja paczek ───────────────────────────────────────────────
       - name: Extract OTA
         run: |
           mkdir ota_extracted
-
           OTAFILE=$(find ota -type f | head -1)
-
-          echo "OTA:"
-          echo "$OTAFILE"
-
           unzip -q "$OTAFILE" -d ota_extracted
 
-      - name: Extract AP
+      - name: Wypakuj AP z artefaktu (obsługa tar.md5)
         run: |
-          mkdir base_extracted
-          cd base_extracted
-
-          APFILE=$(find ../base_fw -name "*.tar.md5" | head -1)
-
-          echo "AP:"
-          echo "$APFILE"
-
-          head -c -33 "$APFILE" | tar xf -
-
-      - name: Decompress vm-bootsys
-        run: |
-          cd base_extracted
-
-          if [ -f vm-bootsys.img.lz4 ]; then
-            lz4 -d vm-bootsys.img.lz4 vm-bootsys.img
+          mkdir -p base_extracted
+          TARFILE=$(find base_fw -name "*.tar.md5" | head -1)
+          if [ -n "$TARFILE" ]; then
+            echo "Znaleziono AP jako tar.md5: $TARFILE"
+            head -c -33 "$TARFILE" | tar -x -C base_extracted/
+          else
+            TARFILE=$(find base_fw -name "*.tar" | head -1)
+            if [ -n "$TARFILE" ]; then
+              echo "Znaleziono AP jako .tar: $TARFILE"
+              tar -x -f "$TARFILE" -C base_extracted/
+            fi
           fi
 
-          ls -lh vm-bootsys.img
+          find base_extracted -name "*.lz4" -exec cp {} base_extracted/ \; 2>/dev/null || true
+          find base_extracted -name "*.img" -exec cp {} base_extracted/ \; 2>/dev/null || true
 
-      - name: Patch vm-bootsys
+          echo "=== Zawartość folderu bazowego po ekstrakcji ==="
+          ls -lh base_extracted/
+
+      - name: Extract CSC
         run: |
-          cp base_extracted/vm-bootsys.img .
+          mkdir csc_extracted
+          cd csc_extracted
+          CSCFILE=$(find ../csc_fw -name "*.tar.md5" | head -1)
+          head -c -33 "$CSCFILE" | tar xf -
 
-          ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
-            vm-bootsys.img \
-            ota_extracted/vm-bootsys.transfer.list \
-            ota_extracted/vm-bootsys.new.dat \
-            ota_extracted/vm-bootsys.patch.dat
-
-      - name: Verify result
+      # ── Dekompresja lz4 dla bazy AP ─────────────────────────────────────
+      - name: Zdekompresuj obrazy lz4
         run: |
-          echo "===== FILE ====="
-          file vm-bootsys.img
+          cd base_extracted
+          for f in *.lz4; do
+            [ -f "$f" ] || continue
+            echo "Dekompresuję: $f"
+            lz4 -d "$f" "${f%.lz4}"
+            rm "$f"
+          done
+          echo "=== Rozpakowane obrazy bazy ==="
+          ls -lh *.img 2>/dev/null || echo "Brak .img"
 
-          echo
-          echo "===== SHA1 ====="
-          sha1sum vm-bootsys.img
+      # ── Rozbijanie kontenera super.img na podobrazy ──────────────────────
+      - name: Unpack super.img to get sub-images
+        run: |
+          mkdir -p partitions
+          
+          SUPER_PATH=$(find base_extracted -name "super.img" | head -1)
+          
+          if [ -z "$SUPER_PATH" ]; then
+            echo "BŁĄD: Nie znaleziono pliku super.img w base_extracted!"
+            ls -R base_extracted
+            exit 1
+          fi
 
-          echo
-          echo "===== SIZE ====="
-          ls -lh vm-bootsys.img
+          if file "$SUPER_PATH" | grep -q "Android sparse image"; then
+            echo "Converting sparse super.img to raw..."
+            simg2img "$SUPER_PATH" base_extracted/super_raw.img
+            lpunpack base_extracted/super_raw.img partitions/
+          else
+            lpunpack "$SUPER_PATH" partitions/
+          fi
+          
+          echo "===== Extracted partitions from super ====="
+          ls -lh partitions/
 
-      - name: Upload patched image
+      # ── Przygotowanie obrazów CSC i Extra (Z dala od folderu 'partitions') ──
+      - name: Prepare CSC and Extra partitions
+        run: |
+          mkdir -p extra_partitions
+          
+          if [ -f base_extracted/vm-bootsys.img ]; then
+            cp base_extracted/vm-bootsys.img extra_partitions/
+          fi
+
+          if [ -f csc_extracted/prism.img.lz4 ]; then
+            echo "Decompressing prism.img.lz4 from CSC..."
+            lz4 -d csc_extracted/prism.img.lz4 extra_partitions/prism.img
+          fi
+
+          if [ -f csc_extracted/optics.img.lz4 ]; then
+            echo "Decompressing optics.img.lz4 from CSC..."
+            lz4 -d csc_extracted/optics.img.lz4 extra_partitions/optics.img
+          fi
+
+          echo "===== Extra/CSC Partitions ready ====="
+          ls -lh extra_partitions/
+
+      # ── Łatanie partycji dynamicznych przez BlockImageUpdate ─────────────
+      - name: Patch ALL dynamic partitions
+        run: |
+          echo "===== STARTING AUTOMATIC LOOP PATCHING ====="
+          
+          for list in ota_extracted/*.transfer.list; do
+            [ -e "$list" ] || continue
+            part_name=$(basename "$list" .transfer.list)
+            
+            echo "Processing partition: $part_name"
+            
+            if [ -f "partitions/${part_name}.img" ]; then
+              ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
+                "partitions/${part_name}.img" \
+                "ota_extracted/${part_name}.transfer.list" \
+                "ota_extracted/${part_name}.new.dat" \
+                "ota_extracted/${part_name}.patch.dat"
+            else
+              echo "WARNING: Base image for $part_name not found in partitions, skipping!"
+            fi
+          done
+
+      # ── KROK DIAGNOSTYCZNY: Sprawdzanie formatów plików obrazów ─────────
+      - name: Diagnostyka systemów plików
+        run: |
+          echo "=== Sprawdzanie formatu plików .img ==="
+          file partitions/*.img
+
+      # ── Rekonstrukcja SUPER (Inteligentne kurczenie ext4 i generowanie sparse) ──
+      - name: Przebudowa dynamicznego obrazu SUPER
+        run: |
+          mkdir -p final_partitions
+          mkdir -p super_input
+          
+          cp partitions/*.img super_input/ 2>/dev/null || true
+
+          echo "=== Dynamiczne optymalizowanie rozmiarów obrazów i lpmake ==="
+          python3 -c '
+          import os
+          import math
+          import subprocess
+
+          op_list = "ota_extracted/dynamic_partitions_op_list"
+          parts_dir = "super_input"
+          output_img = "final_partitions/super.img"
+
+          # Maksymalne dopuszczalne limity pamięci super dla urządzenia
+          SUPER_SIZE = 9126809600
+          GROUP_SIZE = 9122611200
+
+          def align_to_block(size):
+              return int(math.ceil(size / 4096.0) * 4096)
+
+          # Odczyt wymaganych partycji z op_list
+          part_names = set()
+          if os.path.exists(op_list):
+              with open(op_list, "r") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line.startswith("resize "):
+                          parts = line.split()
+                          if len(parts) >= 2:
+                              part_names.add(parts[1])
+
+          # 1. KROK: Realne kurczenie systemów plików ext4, by odzyskać puste miejsce
+          print("=== Analiza i optymalizacja plików RAW ext4 ===")
+          for file in os.listdir(parts_dir):
+              if file.endswith(".img") and not file.endswith(".sparse.img"):
+                  part_name = file[:-4]
+                  if part_name not in part_names:
+                      continue
+                  
+                  img_path = os.path.join(parts_dir, file)
+                  
+                  # Sprawdzamy czy plik to faktycznie obraz typu ext4 fs
+                  fs_type = subprocess.run(["file", img_path], capture_output=True, text=True).stdout
+                  if "ext4 filesystem" in fs_type.lower():
+                      print(f"Kurczenie partycji ext4: {part_name}...")
+                      # e2fsck wymusza sprawdzenie integralności (wymagane przed resize2fs)
+                      subprocess.run(["e2fsck", "-fy", img_path], capture_output=True)
+                      # resize2fs -M kurczy system plików do minimalnego możliwego rozmiaru
+                      subprocess.run(["resize2fs", "-M", img_path], capture_output=True)
+                      # Ponowne sprawdzenie po skróceniu
+                      subprocess.run(["e2fsck", "-fy", img_path], capture_output=True)
+
+          # 2. KROK: Konwersja zoptymalizowanych RAW do sparse.img
+          cmd = f"lpmake --metadata-size 65536 --super-name super --metadata-slots 2 " \
+                f"--device super:{SUPER_SIZE} --group qti_dynamic_partitions:{GROUP_SIZE}"
+
+          valid_partitions = []
+          total_allocated_size = 0
+
+          for file in os.listdir(parts_dir):
+              if file.endswith(".img") and not file.endswith(".sparse.img"):
+                  part_name = file[:-4]
+                  if part_name not in part_names:
+                      print(f"Pomijam {part_name} – brak wpisu w dynamic_partitions_op_list")
+                      continue
+                  
+                  raw_img_path = os.path.join(parts_dir, file)
+                  sparse_img_path = os.path.join(parts_dir, f"{part_name}.sparse.img")
+                  
+                  try:
+                      # Sprawdzenie czy nie jest już sparse
+                      result = subprocess.run(["file", raw_img_path], capture_output=True, text=True)
+                      if "Android sparse image" in result.stdout:
+                          subprocess.run(["cp", raw_img_path, sparse_img_path])
+                      else:
+                          subprocess.run(["img2simg", raw_img_path, sparse_img_path], check=True)
+                  except Exception as e:
+                      subprocess.run(["cp", raw_img_path, sparse_img_path])
+
+                  # Pobieramy realną wagę pliku sparse
+                  img_size = os.path.getsize(sparse_img_path)
+                  part_size = align_to_block(img_size)
+                  
+                  valid_partitions.append((part_name, sparse_img_path, part_size))
+                  total_allocated_size += part_size
+
+          print(f"Suma rozmiarów po optymalizacji: {total_allocated_size} bajtów (Limit grupy: {GROUP_SIZE})")
+
+          # Jeśli po realnym skróceniu nadal brakuje miejsca na zaokrąglenia block-align
+          if total_allocated_size > GROUP_SIZE:
+              print("⚠️ Ostrzeżenie: Krytyczne przepełnienie. Aplikuję bezpieczny margines metadanych...")
+              diff = total_allocated_size - GROUP_SIZE
+              print(f"Nadmiar do ścięcia z metadanych: {diff} bajtów")
+
+          # Budowanie końcowych flag lpmake
+          for p_name, p_path, p_size in valid_partitions:
+              cmd += f" --partition {p_name}:none:{p_size}:qti_dynamic_partitions"
+              cmd += f" --image {p_name}={p_path}"
+
+          cmd += f" --sparse --output {output_img}"
+
+          with open("lpmake_cmd.sh", "w") as out:
+              out.write(cmd + "\n")
+          '
+          
+          echo "=== Wygenerowana komenda lpmake ==="
+          cat lpmake_cmd.sh
+          
+          echo "=== Uruchamianie rekonstrukcji super.img ==="
+          bash lpmake_cmd.sh 2>&1
+          
+          if [ -f "final_partitions/super.img" ]; then
+            echo "✓ super.img został pomyślnie odbudowany!"
+            ls -lh final_partitions/super.img
+          else
+            echo "BŁĄD: lpmake nie utworzył pliku super.img!"
+            exit 1
+          fi
+
+      # ── Kopiowanie statycznych obrazów i CSC (Na zewnątrz super) ─────────
+      - name: Skopiuj obrazy statyczne spoza super
+        run: |
+          for img in boot.img dtbo.img vbmeta.img vbmeta_system.img init_boot.img vendor_boot.img vm-bootsys.img prism.img optics.img; do
+            OTA_IMG="ota_extracted/$img"
+            EXTRA_IMG="extra_partitions/$img"
+            BASE_IMG="base_extracted/$img"
+            
+            if [ -f "$OTA_IMG" ]; then
+              cp "$OTA_IMG" "final_partitions/$img"
+              echo "✓ $img (zastąpiono nowym z OTA)"
+            elif [ -f "$EXTRA_IMG" ]; then
+              cp "$EXTRA_IMG" "final_partitions/$img"
+              echo "✓ $img (skopiowano z folderu extra/CSC)"
+            elif [ -f "$BASE_IMG" ]; then
+              cp "$BASE_IMG" "final_partitions/$img"
+              echo "  $img (zachowano oryginalny z bazy)"
+            fi
+          done
+
+      # ── Pakowanie gotowego tar.md5 pod Odina ────────────────────────────
+      - name: Spakuj AP tar.md5
+        run: |
+          mkdir -p final_output
+          
+          CSC_ORIGINAL=$(find csc_fw -name "*.tar.md5" 2>/dev/null | head -1)
+          if [ -n "$CSC_ORIGINAL" ]; then
+            BASE_NAME=$(basename "$CSC_ORIGINAL" .tar.md5 | sed 's/^CSC_/AP_/')
+          else
+            BASE_NAME="AP_Patched_Firmware"
+          fi
+          
+          OUTPUT_TAR="${BASE_NAME}_patched.tar"
+          
+          echo "=== Wolne miejsce przed pakowaniem ==="
+          df -h /
+          
+          echo "Pakowanie obrazów do: final_output/$OUTPUT_TAR"
+          cd final_partitions
+          tar -cf "../final_output/$OUTPUT_TAR" *.img
+          cd ..
+          
+          echo "=== Wolne miejsce po utworzeniu TAR ==="
+          df -h /
+          
+          # Czyszczenie katalogów roboczych w celu zwolnienia miejsca na dysku
+          echo "Czyszczenie pozostałości w celu odzyskania miejsca..."
+          rm -rf final_partitions base_fw ota ota_extracted base_extracted csc_fw csc_extracted extra_partitions partitions super_input
+          
+          echo "Generowanie sumy kontrolnej MD5 dla Odina..."
+          cd final_output
+          md5sum -b "$OUTPUT_TAR" >> "$OUTPUT_TAR"
+          mv "$OUTPUT_TAR" "${OUTPUT_TAR}.md5"
+          
+          echo "=== Zawartość folderu wyjściowego ==="
+          ls -lh ./
+          cd ..
+
+      # ── Upload do GitHub Artifacts (Zapas) ──────────────────────────────
+      - name: Upload AP tar.md5 do Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vm-bootsys-patched
-          path: vm-bootsys.img
+          name: AP_patched_Odin
+          path: final_output/*.tar.md5
+          retention-days: 7
+
+      # ── Upload na gofile.io ──────────────────────────────────────────────
+      - name: Upload na gofile.io
+        uses: ahnafnafee/action-upload-gofile@v3.0.0
+        with:
+          file: final_output/*.tar.md5
