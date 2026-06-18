@@ -1,20 +1,18 @@
-name: Samsung BLOCK OTA Apply
+name: Full Firmware OTA Patch (with CSC)
 
 on:
   workflow_dispatch:
 
 jobs:
-  apply-ota:
+  patch:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── Zwolnij miejsce na dysku (~20GB) ────────────────────────────────
-      - name: Zwolnij miejsce na dysku
+      - name: Free disk space
         run: |
-          echo "Przed:"
+          echo "Before:"
           df -h /
           sudo rm -rf \
             /usr/share/dotnet \
@@ -25,240 +23,266 @@ jobs:
             "$AGENT_TOOLSDIRECTORY"
           sudo apt-get clean
           docker rmi $(docker images -q) 2>/dev/null || true
-          echo "Po:"
+          echo "After:"
           df -h /
 
-      # ── Narzędzia systemowe ──────────────────────────────────────────────
-      - name: Zainstaluj zależności
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            lz4 brotli python3 python3-pip \
-            zip unzip tar pv wget curl file
-          pip3 install gdown
-
-      # ── Sprawdź wolne miejsce ────────────────────────────────────────────
-      - name: Sprawdź dysk
-        run: df -h
-
-      # ── Pobierz OTA zip z Google Drive (STAŁE ID) ──────────────────────
-      - name: Pobierz OTA zip z Google Drive
-        run: |
-          mkdir -p ota
-          gdown "1YnKZ9qrNmfaEDrI10pkdkSCVevBoUxBh" -O ota/ota.zip
-          SIZE=$(stat -c%s ota/ota.zip 2>/dev/null || echo 0)
-          if [ "$SIZE" -lt 1048576 ]; then
-            echo "❌ Pobrany plik OTA ma tylko $SIZE bajtów"
-            exit 1
-          fi
-          ls -lh ota/
-
-      # ── Pobierz bazowy AP z GitHub Actions Artifact i rozpakuj ZIP ──────
-      - name: Pobierz bazowy AP z GitHub Artifact i rozpakuj ZIP
+      - name: Download AP artifact
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p base_fw
-
-          echo "⬇️  Pobieram artefakt z GitHub..."
-          curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
+          curl -L \
+            -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
-            -L \
-            "https://api.github.com/repos/adamwasowicz9-yansk/urban-winner/actions/artifacts/7705052240/zip" \
-            -o base_fw/base.zip
+            -o ap.zip \
+            "https://api.github.com/repos/durenstudnio/urban-winner/actions/artifacts/7705052240/zip"
+          unzip -q ap.zip -d base_fw
 
-          SIZE=$(stat -c%s base_fw/base.zip 2>/dev/null || echo 0)
-          if [ "$SIZE" -lt 1048576 ]; then
-            echo "❌ Pobrany plik ma tylko $SIZE bajtów – sprawdź token GH_PAT"
-            exit 1
-          fi
-
-          echo "📦 Rozpakowuję ZIP..."
-          unzip -q base_fw/base.zip -d base_fw/
-
-          TAR_MD5=$(find base_fw/ -maxdepth 1 -name "*.tar.md5" | head -1)
-          if [ -z "$TAR_MD5" ]; then
-            echo "❌ Nie znaleziono pliku .tar.md5 w archiwum ZIP"
-            ls -lh base_fw/
-            exit 1
-          fi
-
-          mv "$TAR_MD5" base_fw/AP_base.tar.md5
-          rm -f base_fw/base.zip
-          ls -lh base_fw/
-
-      # ── Wypakuj OTA zip ──────────────────────────────────────────────────
-      - name: Wypakuj OTA zip
+      - name: Download OTA artifact
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          mkdir -p ota_extracted
-          unzip -q ota/ota.zip -d ota_extracted
-          ls -lh ota_extracted/
-          rm ota/ota.zip
+          mkdir -p ota
+          curl -L \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -o ota.zip \
+            "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7709183127/zip"
+          unzip -q ota.zip -d ota
 
-      # ── Wypakuj bazowy AP tar ────────────────────────────────────────────
-      - name: Wypakuj AP tar
+      - name: Download CSC package
         run: |
-          mkdir -p base_extracted
+          mkdir -p csc_fw
+          wget -q "https://github.com/adamwasowicz9-yansk/johnas/releases/download/v69/m1v7kv.zip" -O m1v7kv.zip
+          unzip -q m1v7kv.zip -d csc_fw
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip lz4 wget file simg2img android-sdk-libsparse-utils python3
+          
+          # Stabilny link do OpenSSL 1.0 dla BlockImageUpdate
+          wget -q https://launchpad.net/ubuntu/+archive/primary/+files/libssl1.0.0_1.0.2n-1ubuntu5.13_amd64.deb
+          sudo dpkg -i libssl1.0.0_*.deb || true
+          sudo ldconfig
+
+          # Pobranie binariów lpunpack i lpmake z mirrora (wersja RAW)
+          wget -q -O lpunpack https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpunpack
+          wget -q -O lpmake https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpmake
+          
+          chmod +x lpunpack lpmake
+          sudo cp lpunpack lpmake /usr/local/bin/
+
+      - name: Download IMG Patch Tools
+        run: |
+          wget -q https://github.com/erfanoabdi/imgpatchtools/releases/download/0.3/IMG_Patch_Tools_0.3.zip
+          unzip -q IMG_Patch_Tools_0.3.zip
+          chmod +x IMG_Patch_Tools_0.3/Linux_x64/*
+
+      - name: Extract OTA
+        run: |
+          mkdir ota_extracted
+          OTAFILE=$(find ota -type f | head -1)
+          unzip -q "$OTAFILE" -d ota_extracted
+
+      - name: Extract AP
+        run: |
+          mkdir base_extracted
           cd base_extracted
-          head -c -33 ../base_fw/AP_base.tar.md5 | tar x
-          ls -lh
-          rm ../base_fw/AP_base.tar.md5
+          APFILE=$(find ../base_fw -name "*.tar.md5" | head -1)
+          head -c -33 "$APFILE" | tar xf -
 
-      # ── Zdekompresuj obrazy lz4 ─────────────────────────────────────────
-      - name: Zdekompresuj obrazy lz4
+      - name: Extract CSC
         run: |
-          cd base_extracted
-          for f in *.lz4; do
-            [ -f "$f" ] || continue
-            echo "Dekompresuję: $f"
-            lz4 -d "$f" "${f%.lz4}"
-            rm "$f"
-          done
-          ls -lh *.img 2>/dev/null || echo "Brak .img"
+          mkdir csc_extracted
+          cd csc_extracted
+          CSCFILE=$(find ../csc_fw -name "*.tar.md5" | head -1)
+          head -c -33 "$CSCFILE" | tar xf -
 
-      # ── Zainstaluj lpunpack i simg2img ──────────────────────────────────
-      - name: Zainstaluj lpunpack i simg2img
-        run: |
-          # simg2img z apt – brak problemów z bibliotekami
-          sudo apt-get install -y android-sdk-libsparse-utils
-
-          # lpunpack z zewnętrznego źródła
-          wget -q --header="User-Agent: Mozilla/5.0" \
-            https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/refs/heads/Linux-debian/binary/lpunpack
-          chmod +x lpunpack
-          sudo mv lpunpack /usr/local/bin/
-
-          echo "✅ Narzędzia zainstalowane:"
-          lpunpack 2>&1 | head -1 || echo "lpunpack OK"
-          simg2img 2>&1 | head -1 || echo "simg2img OK"
-
-      # ── Wypakuj partycje z super.img (obsługa sparse) ───────────────────
-      - name: Wypakuj partycje z super.img
+      - name: Unpack super.img to get sub-images
         run: |
           mkdir -p partitions
-
-          if [ -f base_extracted/super.img ]; then
-            echo "🔍 Sprawdzam czy super.img jest sparse..."
-            if file base_extracted/super.img | grep -q "Android sparse image"; then
-              echo "📦 super.img jest w formacie sparse – konwertuję do raw..."
-              simg2img base_extracted/super.img base_extracted/super_raw.img
-              echo "✅ Konwersja zakończona"
-              echo "📂 Wypakowuję partycje z super_raw.img..."
-              lpunpack base_extracted/super_raw.img partitions/
-              rm base_extracted/super_raw.img
-            else
-              echo "📂 super.img jest już w formacie raw – wypakowuję..."
-              lpunpack base_extracted/super.img partitions/
-            fi
-            ls -lh partitions/
+          
+          # Sprawdzenie czy super.img to obraz rzadki (sparse) i konwersja jeśli trzeba
+          if file base_extracted/super.img | grep -q "Android sparse image"; then
+            echo "Converting sparse super.img to raw..."
+            simg2img base_extracted/super.img base_extracted/super_raw.img
+            lpunpack base_extracted/super_raw.img partitions/
           else
-            echo "⚠️ Brak super.img – kopiuję osobne obrazy"
-            cp base_extracted/*.img partitions/ 2>/dev/null || true
+            lpunpack base_extracted/super.img partitions/
+          fi
+          
+          echo "===== Extracted partitions from super ====="
+          ls -lh partitions/
+
+      - name: Prepare CSC and Extra partitions
+        run: |
+          # 1. Dekompresja vm-bootsys
+          if [ -f base_extracted/vm-bootsys.img.lz4 ]; then
+            lz4 -d base_extracted/vm-bootsys.img.lz4 partitions/vm-bootsys.img
+          elif [ -f base_extracted/vm-bootsys.img ]; then
+            cp base_extracted/vm-bootsys.img partitions/
           fi
 
-      # ── Pobierz narzędzia BLOCK OTA (commaai) ──────────────────────────
-      - name: Pobierz narzędzia BLOCK OTA
+          # 2. Dekompresja prism z paczki CSC
+          if [ -f csc_extracted/prism.img.lz4 ]; then
+            echo "Decompressing prism.img.lz4 from CSC..."
+            lz4 -d csc_extracted/prism.img.lz4 partitions/prism.img
+          fi
+
+          # 3. Dekompresja optics z paczki CSC
+          if [ -f csc_extracted/optics.img.lz4 ]; then
+            echo "Decompressing optics.img.lz4 from CSC..."
+            lz4 -d csc_extracted/optics.img.lz4 partitions/optics.img
+          fi
+
+          echo "===== Partitions ready for patching ====="
+          ls -lh partitions/
+
+      - name: Patch ALL dynamic partitions
         run: |
-          wget -q -O blockimgdiff.py \
-            https://raw.githubusercontent.com/commaai/android_build/refs/heads/master/tools/releasetools/blockimgdiff.py
-          wget -q -O rangelib.py \
-            https://raw.githubusercontent.com/commaai/android_build/refs/heads/master/tools/releasetools/rangelib.py
-
-      # ── Zastosuj patche dla każdej partycji ─────────────────────────────
-      - name: Zastosuj BLOCK OTA patche
-        run: |
-          mkdir -p output_partitions
-          OTA_DIR="ota_extracted"
-          FAILED=0
-
-          for tlist in "$OTA_DIR"/*.transfer.list; do
-            [ -f "$tlist" ] || continue
-            PART=$(basename "$tlist" .transfer.list)
-            echo "━━━ Partycja: $PART ━━━"
-
-            NEW_DAT_BR="$OTA_DIR/${PART}.new.dat.br"
-            NEW_DAT="$OTA_DIR/${PART}.new.dat"
-            PATCH_DAT="$OTA_DIR/${PART}.patch.dat"
-
-            if [ -f "$NEW_DAT_BR" ]; then
-              echo "  Dekompresuję brotli..."
-              brotli -d "$NEW_DAT_BR" -o "$NEW_DAT"
-            fi
-
-            SRC_IMG=$(ls partitions/${PART}.img 2>/dev/null | head -1)
-
-            if [ -z "$SRC_IMG" ]; then
-              echo "  ⚠️  Brak źródłowego obrazu dla $PART, pomijam"
-              continue
-            fi
-
-            echo "  Źródło: $SRC_IMG"
-            cp "$SRC_IMG" "output_partitions/${PART}.img"
-
-            python3 blockimgdiff.py \
-              --source "output_partitions/${PART}.img" \
-              --transfer "$tlist" \
-              --new_data "$NEW_DAT" \
-              --patch "$PATCH_DAT" \
-              --output "output_partitions/${PART}.img.new"
-
-            if [ $? -eq 0 ]; then
-              mv "output_partitions/${PART}.img.new" "output_partitions/${PART}.img"
-              echo "  ✓ Gotowe"
+          echo "===== STARTING AUTOMATIC LOOP PATCHING ====="
+          
+          # Pętla lecąca po wszystkich listach transferowych znalezionych w OTA
+          for list in ota_extracted/*.transfer.list; do
+            [ -e "$list" ] || continue
+            
+            # Wyciąganie czystej nazwy partycji
+            part_name=$(basename "$list" .transfer.list)
+            
+            echo "--------------------------------------------------"
+            echo "Processing partition: $part_name"
+            echo "--------------------------------------------------"
+            
+            # Sprawdzenie czy mamy pasujący plik bazowy .img
+            if [ -f "partitions/${part_name}.img" ]; then
+              ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
+                "partitions/${part_name}.img" \
+                "ota_extracted/${part_name}.transfer.list" \
+                "ota_extracted/${part_name}.new.dat" \
+                "ota_extracted/${part_name}.patch.dat"
             else
-              echo "  ✗ Błąd dla $PART"
-              FAILED=1
+              echo "WARNING: Base image for $part_name not found in partitions, skipping!"
             fi
-
-            rm -f "$NEW_DAT" "$NEW_DAT_BR"
           done
 
-          [ $FAILED -eq 0 ] || (echo "❌ Niektóre partycje nie zostały spatchowane!" && exit 1)
-          ls -lh output_partitions/
-
-      # ── Skopiuj obrazy spoza dynamic partitions ─────────────────────────
-      - name: Skopiuj obrazy statyczne
+      - name: Verify Result
         run: |
-          for img in boot.img dtbo.img vbmeta.img vbmeta_system.img; do
+          echo "===== Patched Files Size ====="
+          ls -lh partitions/
+
+      # ── WBUDOWANY I NIEZALEŻNY AUTOMAT LPMAKE (ZAMIAST SKRYPTU Z 404) ───
+      - name: Przebudowa dynamicznego obrazu SUPER
+        run: |
+          mkdir -p final_partitions
+          
+          echo "=== Generowanie argumentów lpmake za pomocą wbudowanego skryptu Python ==="
+          python3 -c '
+          import os
+
+          op_list = "ota_extracted/dynamic_partitions_op_list"
+          parts_dir = "partitions"
+          output_img = "final_partitions/super.img"
+
+          # Stałe wartości geometrii super dla Samsunga Galaxy S22 5G (r0q)
+          SUPER_SIZE = 9126805504
+          GROUP_SIZE = 9122611200
+
+          # Słownik przechowujący docelowe rozmiary partycji wyciągnięte z pliku op_list
+          sizes = {}
+
+          if os.path.exists(op_list):
+              with open(op_list, "r") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line.startswith("resize "):
+                          parts = line.split()
+                          if len(parts) >= 3:
+                              sizes[parts[1]] = parts[2]
+
+          # Budujemy bazową komendę lpmake
+          cmd = f"lpmake --metadata-size 65536 --super-name super --metadata-slots 2 " \
+                f"--device super:{SUPER_SIZE} --group qti_dynamic_partitions:{GROUP_SIZE}"
+
+          # Dodajemy każdą partycję, która fizycznie istnieje w folderze partitions/
+          for file in os.listdir(parts_dir):
+              if file.endswith(".img"):
+                  part_name = file[:-4]
+                  # Jeśli ota podaje nowy rozmiar, bierzemy go. Jeśli nie, sprawdzamy rozmiar pliku na dysku.
+                  part_size = sizes.get(part_name, os.path.getsize(os.path.join(parts_dir, file)))
+                  
+                  cmd += f" --partition {part_name}:none:{part_size}:qti_dynamic_partitions"
+                  cmd += f" --image {part_name}={os.path.join(parts_dir, file)}"
+
+          cmd += f" --output {output_img}"
+
+          # Zapisujemy wygenerowaną komendę do skryptu powłoki
+          with open("lpmake_cmd.sh", "w") as out:
+              out.write(cmd + "\n")
+          '
+          
+          echo "=== Wygenerowana komenda lpmake ==="
+          cat lpmake_cmd.sh
+          
+          echo "=== Uruchamianie rekonstrukcji super.img ==="
+          bash lpmake_cmd.sh
+          
+          if [ -f "final_partitions/super.img" ]; then
+            echo "✓ super.img został pomyślnie i perfekcyjnie odbudowany!"
+            ls -lh final_partitions/super.img
+          else
+            echo "BŁĄD: Wbudowany generator lpmake nie utworzył pliku super.img!" && exit 1
+          fi
+
+      # ── Kopiowanie statycznych obrazów i przygotowanie AP pod Odina ───────
+      - name: Skopiuj obrazy statyczne spoza super
+        run: |
+          for img in boot.img dtbo.img vbmeta.img vbmeta_system.img init_boot.img vendor_boot.img vm-bootsys.img; do
             OTA_IMG="ota_extracted/$img"
             BASE_IMG="base_extracted/$img"
             if [ -f "$OTA_IMG" ]; then
-              cp "$OTA_IMG" "output_partitions/$img"
-              echo "✓ $img (z OTA)"
+              cp "$OTA_IMG" "final_partitions/$img"
+              echo "✓ $img (zastąpiono z OTA)"
             elif [ -f "$BASE_IMG" ]; then
-              cp "$BASE_IMG" "output_partitions/$img"
-              echo "  $img (z bazy)"
+              cp "$BASE_IMG" "final_partitions/$img"
+              echo "  $img (zachowano z bazy)"
             fi
           done
 
-      # ── Spakuj nowy AP tar.md5 (dynamiczna nazwa) ──────────────────────
+      # ── Pakowanie gotowego tar.md5 pod Odina ────────────────────────────
       - name: Spakuj AP tar.md5
         run: |
-          mkdir -p final
-          BASE_NAME=$(basename "$(find base_fw/ -name "*.tar.md5" 2>/dev/null | head -1)" .tar.md5 2>/dev/null || echo "AP_patched")
+          mkdir -p final_output
+          
+          # Wyciągnięcie oryginalnej nazwy pliku AP
+          BASE_NAME=$(basename "$(find base_fw -name "AP_*.tar.md5" 2>/dev/null | head -1)" .tar.md5 2>/dev/null || echo "AP_Patched_Firmware")
           OUTPUT="${BASE_NAME}_patched.tar"
-
-          cd output_partitions
-          tar -H ustar -c *.img -f "../final/$OUTPUT"
+          
+          echo "Pakowanie obrazów do: $OUTPUT"
+          cd final_partitions
+          
+          # Standardowe pakowanie tar (Zoptymalizowane pod Odina)
+          tar -c *.img -f "../final_output/$OUTPUT"
           cd ..
+          
+          # Doklejenie sumy kontrolnej MD5 na koniec archiwum - wymóg Odina
+          echo "Generowanie sumy kontrolnej MD5..."
+          md5sum -t "final_output/$OUTPUT" >> "final_output/$OUTPUT"
+          mv "final_output/$OUTPUT" "final_output/${OUTPUT%.tar}.tar.md5"
+          
+          echo "=== Zawartość folderu wyjściowego ==="
+          ls -lh final_output/
 
-          md5sum -t "final/$OUTPUT" >> "final/$OUTPUT"
-          mv "final/$OUTPUT" "final/${OUTPUT%.tar}.tar.md5"
-
-          ls -lh final/
-          df -h
-
-      # ── Upload do GitHub Artifacts (zapas) ──────────────────────────────
+      # ── Upload do GitHub Artifacts (Zapas) ──────────────────────────────
       - name: Upload AP tar.md5 do Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AP_patched
-          path: final/*.tar.md5
+          name: AP_patched_Odin
+          path: final_output/*.tar.md5
           retention-days: 7
 
       # ── Upload na gofile.io ──────────────────────────────────────────────
       - name: Upload na gofile.io
         uses: ahnafnafee/action-upload-gofile@v3.0.0
         with:
-          file: final/*.tar.md5
+          file: final_output/*.tar.md5
