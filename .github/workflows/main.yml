@@ -202,18 +202,16 @@ jobs:
             fi
           done
 
-      # ── Rekonstrukcja SUPER (Automatyczne wykrywanie geometrii i blokada przepełnienia) ───
+      # ── Rekonstrukcja SUPER (tylko partycje z dynamic_partitions_op_list) ──
       - name: Przebudowa dynamicznego obrazu SUPER
         run: |
           mkdir -p final_partitions
           mkdir -p super_input
           
-          # Przenosimy do dedykowanego folderu TYLKO te obrazy, które oryginalnie były w super
-          # Zapobiega to doklejaniu prism, optics i vm-bootsys do grupy qti_dynamic_partitions
-          cp partitions/*.img super_input/
-          rm -f super_input/prism.img super_input/optics.img super_input/vm-bootsys.img 2>/dev/null || true
+          # Kopiujemy wszystkie obrazy z partitions do super_input (potem odfiltrujemy)
+          cp partitions/*.img super_input/ 2>/dev/null || true
 
-          echo "=== Dynamiczne generowanie argumentów lpmake ==="
+          echo "=== Dynamiczne generowanie argumentów lpmake (filtrowanie po op_list) ==="
           python3 -c '
           import os
           import math
@@ -222,13 +220,15 @@ jobs:
           parts_dir = "super_input"
           output_img = "final_partitions/super.img"
 
-          # Rozmiary dla serii S22 (S901E) pobrane bezpośrednio z Twojego logu lpmake
+          # Rozmiary dla serii S22 (S901E) – dostosuj jeśli potrzeba
           SUPER_SIZE = 9126809600
           GROUP_SIZE = 9122611200
 
           def align_to_block(size):
               return int(math.ceil(size / 4096.0) * 4096)
 
+          # Wczytaj nazwy partycji z op_list (linie "resize <name> <size>")
+          part_names = set()
           sizes = {}
           if os.path.exists(op_list):
               with open(op_list, "r") as f:
@@ -237,17 +237,23 @@ jobs:
                       if line.startswith("resize "):
                           parts = line.split()
                           if len(parts) >= 3:
-                              sizes[parts[1]] = int(parts[2])
+                              name = parts[1]
+                              size = int(parts[2])
+                              sizes[name] = size
+                              part_names.add(name)
 
           cmd = f"lpmake --metadata-size 65536 --super-name super --metadata-slots 2 " \
                 f"--device super:{SUPER_SIZE} --group qti_dynamic_partitions:{GROUP_SIZE}"
 
+          # Dodajemy tylko te partycje, które są wymienione w op_list
           for file in os.listdir(parts_dir):
               if file.endswith(".img"):
                   part_name = file[:-4]
+                  if part_name not in part_names:
+                      print(f"Pomijam {part_name} – brak wpisu w dynamic_partitions_op_list")
+                      continue
                   raw_size = sizes.get(part_name, os.path.getsize(os.path.join(parts_dir, file)))
                   part_size = align_to_block(raw_size)
-                  
                   cmd += f" --partition {part_name}:none:{part_size}:qti_dynamic_partitions"
                   cmd += f" --image {part_name}={os.path.join(parts_dir, file)}"
 
