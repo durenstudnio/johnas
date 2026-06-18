@@ -10,6 +10,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          echo "Before:"
+          df -h /
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY"
+
+          sudo apt-get clean
+
+          docker rmi $(docker images -q) 2>/dev/null || true
+
+          echo "After:"
+          df -h /
+
       - name: Download AP artifact
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
@@ -20,7 +40,7 @@ jobs:
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
             -o ap.zip \
-            "https://api.github.com/repos/adamwasowicz9-yansk/urban-winner/actions/artifacts/7705052240/zip"
+            "https://api.github.com/repos/durenstudnio/urban-winner/actions/artifacts/7705052240/zip"
 
           unzip -q ap.zip -d base_fw
 
@@ -34,14 +54,31 @@ jobs:
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
             -o ota.zip \
-            "https://api.github.com/repos/adamwasowicz9-yansk/johnas/actions/artifacts/7709183127/zip"
+            "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7709183127/zip"
 
           unzip -q ota.zip -d ota
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip lz4 wget
+
+          sudo apt-get install -y \
+            unzip \
+            zip \
+            lz4 \
+            wget \
+            file
+
+          wget -q \
+            http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.0.0_1.0.2n-1ubuntu5.13_amd64.deb
+
+          sudo dpkg -i libssl1.0.0_1.0.2n-1ubuntu5.13_amd64.deb || true
+
+          sudo ldconfig
+
+          echo "===== OpenSSL ====="
+          ls -l /usr/lib/x86_64-linux-gnu/libcrypto* || true
+          ls -l /usr/lib/x86_64-linux-gnu/libssl* || true
 
       - name: Download IMG Patch Tools
         run: |
@@ -52,11 +89,18 @@ jobs:
 
           chmod +x IMG_Patch_Tools_0.3/Linux_x64/*
 
+      - name: Check IMG Patch Tools dependencies
+        run: |
+          ldd IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate || true
+
       - name: Extract OTA
         run: |
           mkdir ota_extracted
 
           OTAFILE=$(find ota -type f | head -1)
+
+          echo "OTA:"
+          echo "$OTAFILE"
 
           unzip -q "$OTAFILE" -d ota_extracted
 
@@ -66,6 +110,9 @@ jobs:
           cd base_extracted
 
           APFILE=$(find ../base_fw -name "*.tar.md5" | head -1)
+
+          echo "AP:"
+          echo "$APFILE"
 
           head -c -33 "$APFILE" | tar xf -
 
@@ -83,7 +130,7 @@ jobs:
         run: |
           cp base_extracted/vm-bootsys.img .
 
-          IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
+          ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
             vm-bootsys.img \
             ota_extracted/vm-bootsys.transfer.list \
             ota_extracted/vm-bootsys.new.dat \
@@ -91,8 +138,15 @@ jobs:
 
       - name: Verify result
         run: |
+          echo "===== FILE ====="
           file vm-bootsys.img
+
+          echo
+          echo "===== SHA1 ====="
           sha1sum vm-bootsys.img
+
+          echo
+          echo "===== SIZE ====="
           ls -lh vm-bootsys.img
 
       - name: Upload patched image
