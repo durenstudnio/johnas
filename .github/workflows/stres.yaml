@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: "Link do ZIP zawierającego system.img i product.img"
+        description: "Direct URL lub PixelDrain URL"
         required: true
 
 jobs:
@@ -21,11 +21,23 @@ jobs:
           sudo apt install -y \
             android-sdk-libsparse-utils \
             e2fsprogs \
-            unzip
+            unzip \
+            wget
 
       - name: Download ROM ZIP
         run: |
-          wget "${{ github.event.inputs.zip_url }}" -O rom.zip
+          URL="${{ github.event.inputs.zip_url }}"
+
+          if echo "$URL" | grep -qi "pixeldrain.com"; then
+            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/(u|api/file)/([^/?]+).*#\2#')
+            echo "PixelDrain ID: $FILE_ID"
+
+            wget "https://pixeldrain.com/api/file/$FILE_ID?download" -O rom.zip
+          else
+            wget "$URL" -O rom.zip
+          fi
+
+          ls -lh rom.zip
 
       - name: Extract ZIP
         run: |
