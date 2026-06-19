@@ -164,15 +164,59 @@ jobs:
           done
 
       # ── Kopiowanie gotowych obrazów do artefaktów ──────────────────────
-      - name: Prepare artifacts
-        run: |
-          mkdir -p final_imgs
-          cp partitions/system.img final_imgs/
-          cp partitions/system_ext.img final_imgs/
-          cp partitions/product.img final_imgs/
-          echo "Gotowe obrazy:"
-          ls -lh final_imgs/
+      - name: Merge system_ext into system and fix nesting
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y e2fsprogs e2tools
 
+    mkdir -p mnt_system mnt_system_ext mnt_new
+
+    sudo mount -o loop partitions/system.img mnt_system
+    sudo mount -o loop partitions/system_ext.img mnt_system_ext
+
+    OLD_SIZE=$(stat -c%s partitions/system.img)
+    NEW_SIZE=$((OLD_SIZE + 200*1024*1024))
+
+    echo "Tworzę nowy obraz o rozmiarze $NEW_SIZE bajtów..."
+    dd if=/dev/zero of=partitions/system_merged.img bs=1M count=$((NEW_SIZE / 1024 / 1024 + 2)) status=progress
+    mkfs.ext4 -F partitions/system_merged.img
+
+    sudo mount -o loop partitions/system_merged.img mnt_new
+
+    # Spłaszcz /system (usuń zagnieżdżenie system/system)
+    if [ -d "mnt_system/system" ] && [ $(ls -1 mnt_system | wc -l) -eq 1 ]; then
+      echo "🔧 Wykryto zagnieżdżenie – podnoszę zawartość"
+      sudo cp -a mnt_system/system/* mnt_new/
+    else
+      echo "✅ Struktura płaska"
+      sudo cp -a mnt_system/* mnt_new/
+    fi
+
+    # Wklej system_ext do /system_ext
+    echo "📦 Scalanie system_ext do /system_ext"
+    if [ -d "mnt_system_ext/system_ext" ] && [ $(ls -1 mnt_system_ext | wc -l) -eq 1 ]; then
+      sudo mkdir -p mnt_new/system_ext
+      sudo cp -a mnt_system_ext/system_ext/* mnt_new/system_ext/
+    else
+      sudo mkdir -p mnt_new/system_ext
+      sudo cp -a mnt_system_ext/* mnt_new/system_ext/
+    fi
+
+    sudo umount mnt_system mnt_system_ext mnt_new
+
+    mv partitions/system_merged.img partitions/system.img
+    rm -f partitions/system_ext.img
+
+    echo "✅ Gotowe! system_ext scalony, zagnieżdżenie naprawione."
+
+- name: Prepare artifacts
+  run: |
+    mkdir -p final_imgs
+    cp partitions/system.img final_imgs/
+    # system_ext już nie istnieje – jest w system.img
+    cp partitions/product.img final_imgs/ 2>/dev/null || true
+    echo "Gotowe obrazy:"
+    ls -lh final_imgs/
       - name: Upload images as artifacts
         uses: actions/upload-artifact@v4
         with:
