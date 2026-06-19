@@ -160,12 +160,16 @@ jobs:
           # Sprawdź, czy istnieje podkatalog system/
           if [ -d "mnt_system/system" ]; then
             echo "Znaleziono zagnieżdżony katalog system/, przenoszę zawartość do głównego system/"
+            # Utwórz katalog tymczasowy
+            mkdir -p /tmp/system_root
             # Kopiujemy wszystko z mnt_system/system do tymczasowego miejsca
             sudo cp -a mnt_system/system/* /tmp/system_root/
             # Czyścimy stary system (oprócz samego system/)
             sudo rm -rf mnt_system/*
             # Przywracamy zawartość
             sudo cp -a /tmp/system_root/* mnt_system/
+            # Usuwamy tymczasowy katalog
+            sudo rm -rf /tmp/system_root
           else
             echo "Brak zagnieżdżenia, nic nie robię."
           fi
@@ -188,7 +192,7 @@ jobs:
           sudo umount mnt_system
 
           mv partitions/system_new.img partitions/system.img
-          rm -rf mnt_system mnt_new /tmp/system_root
+          rm -rf mnt_system mnt_new
 
       # ── Prepare artifacts (tylko system i product) ────────────────────
       - name: Prepare artifacts
