@@ -47,7 +47,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p base_fw
-          curl -L -H "Authorization: Bearer $GH_PAT" -H "Accept: application/vnd.github+json" -o ap.zip \
+          curl -L -H "Authorization: Bearer $GH_PAT" -o ap.zip \
             "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7736838535/zip"
           unzip -q ap.zip -d base_fw
 
@@ -56,7 +56,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p ota
-          curl -L -H "Authorization: Bearer $GH_PAT" -H "Accept: application/vnd.github+json" -o ota.zip \
+          curl -L -H "Authorization: Bearer $GH_PAT" -o ota.zip \
             "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7709183127/zip"
           unzip -q ota.zip -d ota
 
@@ -67,11 +67,11 @@ jobs:
           OTAFILE=$(find ota -type f | head -1)
           unzip -q "$OTAFILE" -d ota_extracted
 
-      # ── Ekstrakcja AP (super.img) ──────────────────────────────────────
+      # ── Ekstrakcja AP ───────────────────────────────────────────────────
       - name: Extract AP (tar.md5)
         run: |
           mkdir -p base_extracted
-          # rozpakuj zagnieżdżone zipy (max 3)
+
           for i in 1 2 3; do
             TARFILE=$(find base_fw -name "*.tar.md5" -o -name "*.tar" | head -1)
             [ -n "$TARFILE" ] && break
@@ -88,39 +88,34 @@ jobs:
             [ -n "$TARFILE" ] && tar -x -f "$TARFILE" -C base_extracted/
           fi
 
-          if [ -z "$TARFILE" ]; then
-            echo "BŁĄD: Brak pliku .tar/.tar.md5 w artefakcie AP"
-            exit 1
-          fi
-
-      # ── Dekompresja lz4 ─────────────────────────────────────────────────
+      # ── Decompress lz4 ────────────────────────────────────────────────
       - name: Decompress lz4
         run: |
           cd base_extracted
           for f in *.lz4; do
             [ -f "$f" ] || continue
             lz4 -d "$f" "${f%.lz4}"
-            rm "$f"
+            rm -f "$f"
           done
 
-      # ── Rozpakowanie super.img ──────────────────────────────────────────
+      # ── Unpack super.img ──────────────────────────────────────────────
       - name: Unpack super.img
         run: |
           mkdir -p partitions
           SUPER=$(find base_extracted -name "super.img" | head -1)
+
           if [ -z "$SUPER" ]; then
             echo "BŁĄD: Nie znaleziono super.img"
             exit 1
           fi
 
           if ! lpunpack "$SUPER" partitions/; then
-            echo "lpunpack nie obsługuje sparse, konwersja do raw..."
+            echo "fallback lpunpack"
             simg2img "$SUPER" base_extracted/super_raw.img
             lpunpack base_extracted/super_raw.img partitions/
-            rm -f base_extracted/super_raw.img
           fi
 
-      # ── Patchowanie tylko system, system_ext, product ──────────────────
+      # ── Patch ──────────────────────────────────────────────────────────
       - name: Patch system, system_ext, product
         run: |
           TARGETS="system system_ext product"
@@ -128,95 +123,66 @@ jobs:
 
           for part in $TARGETS; do
             BASE="partitions/${part}.img"
-            [ -f "$BASE" ] || { echo "⚠️  Brak $BASE – pomijam"; continue; }
+            [ -f "$BASE" ] || continue
 
-            # 1) resize jeśli występuje w op_list
             if [ -f "$OP_LIST" ]; then
               TARGET_SIZE=$(grep -E "^resize ${part}(_a)? " "$OP_LIST" | awk '{print $3}' | tail -1)
-              if [ -n "$TARGET_SIZE" ]; then
-                CURRENT_SIZE=$(stat -c%s "$BASE")
-                if [ "$TARGET_SIZE" -gt "$CURRENT_SIZE" ]; then
-                  echo "GROW $part: $CURRENT_SIZE -> $TARGET_SIZE (przed patchem)"
-                  truncate -s "$TARGET_SIZE" "$BASE"
-                elif [ "$TARGET_SIZE" -lt "$CURRENT_SIZE" ]; then
-                  echo "SHRINK $part: $CURRENT_SIZE -> $TARGET_SIZE (po patchu)"
-                fi
+              CURRENT_SIZE=$(stat -c%s "$BASE")
+
+              if [ -n "$TARGET_SIZE" ] && [ "$TARGET_SIZE" -gt "$CURRENT_SIZE" ]; then
+                truncate -s "$TARGET_SIZE" "$BASE"
               fi
             fi
 
-            # 2) wykonaj patch
             cp "$BASE" "${BASE}.bak"
+
             ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
               "$BASE" \
               "ota_extracted/${part}.transfer.list" \
               "ota_extracted/${part}.new.dat" \
-              "ota_extracted/${part}.patch.dat" || {
-                echo "⚠️  Patch dla $part nie powiódł się – przywracam obraz bazowy"
-                mv "${BASE}.bak" "$BASE"
-              }
-            rm -f "${BASE}.bak"
+              "ota_extracted/${part}.patch.dat" || mv "${BASE}.bak" "$BASE"
 
-            # 3) shrink po patchu (jeśli był zaplanowany)
-            if [ -f "$OP_LIST" ] && [ -n "$TARGET_SIZE" ] && [ "$TARGET_SIZE" -lt "$CURRENT_SIZE" ]; then
-              echo "Wykonuję shrink dla $part"
-              truncate -s "$TARGET_SIZE" "$BASE"
-            fi
+            rm -f "${BASE}.bak"
           done
 
-      # ── Kopiowanie gotowych obrazów do artefaktów ──────────────────────
+      # ── Merge system_ext ───────────────────────────────────────────────
       - name: Merge system_ext into system and fix nesting
-  run: |
-    sudo apt-get update
-    sudo apt-get install -y e2fsprogs e2tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs e2tools
 
-    mkdir -p mnt_system mnt_system_ext mnt_new
+          mkdir -p mnt_system mnt_system_ext mnt_new
 
-    sudo mount -o loop partitions/system.img mnt_system
-    sudo mount -o loop partitions/system_ext.img mnt_system_ext
+          sudo mount -o loop partitions/system.img mnt_system
+          sudo mount -o loop partitions/system_ext.img mnt_system_ext
 
-    OLD_SIZE=$(stat -c%s partitions/system.img)
-    NEW_SIZE=$((OLD_SIZE + 200*1024*1024))
+          OLD_SIZE=$(stat -c%s partitions/system.img)
+          NEW_SIZE=$((OLD_SIZE + 200*1024*1024))
 
-    echo "Tworzę nowy obraz o rozmiarze $NEW_SIZE bajtów..."
-    dd if=/dev/zero of=partitions/system_merged.img bs=1M count=$((NEW_SIZE / 1024 / 1024 + 2)) status=progress
-    mkfs.ext4 -F partitions/system_merged.img
+          dd if=/dev/zero of=partitions/system_merged.img bs=1M count=$((NEW_SIZE / 1024 / 1024 + 2))
+          mkfs.ext4 -F partitions/system_merged.img
 
-    sudo mount -o loop partitions/system_merged.img mnt_new
+          sudo mount -o loop partitions/system_merged.img mnt_new
 
-    # Spłaszcz /system (usuń zagnieżdżenie system/system)
-    if [ -d "mnt_system/system" ] && [ $(ls -1 mnt_system | wc -l) -eq 1 ]; then
-      echo "🔧 Wykryto zagnieżdżenie – podnoszę zawartość"
-      sudo cp -a mnt_system/system/* mnt_new/
-    else
-      echo "✅ Struktura płaska"
-      sudo cp -a mnt_system/* mnt_new/
-    fi
+          sudo cp -a mnt_system/* mnt_new/
+          sudo mkdir -p mnt_new/system_ext
+          sudo cp -a mnt_system_ext/* mnt_new/system_ext/
 
-    # Wklej system_ext do /system_ext
-    echo "📦 Scalanie system_ext do /system_ext"
-    if [ -d "mnt_system_ext/system_ext" ] && [ $(ls -1 mnt_system_ext | wc -l) -eq 1 ]; then
-      sudo mkdir -p mnt_new/system_ext
-      sudo cp -a mnt_system_ext/system_ext/* mnt_new/system_ext/
-    else
-      sudo mkdir -p mnt_new/system_ext
-      sudo cp -a mnt_system_ext/* mnt_new/system_ext/
-    fi
+          sudo umount mnt_system mnt_system_ext mnt_new
 
-    sudo umount mnt_system mnt_system_ext mnt_new
+          mv partitions/system_merged.img partitions/system.img
+          rm -f partitions/system_ext.img
 
-    mv partitions/system_merged.img partitions/system.img
-    rm -f partitions/system_ext.img
+      # ── Prepare artifacts ──────────────────────────────────────────────
+      - name: Prepare artifacts
+        run: |
+          mkdir -p final_imgs
+          cp partitions/system.img final_imgs/
+          cp partitions/product.img final_imgs/ 2>/dev/null || true
 
-    echo "✅ Gotowe! system_ext scalony, zagnieżdżenie naprawione."
+          ls -lh final_imgs/
 
-- name: Prepare artifacts
-  run: |
-    mkdir -p final_imgs
-    cp partitions/system.img final_imgs/
-    # system_ext już nie istnieje – jest w system.img
-    cp partitions/product.img final_imgs/ 2>/dev/null || true
-    echo "Gotowe obrazy:"
-    ls -lh final_imgs/
+      # ── Upload ─────────────────────────────────────────────────────────
       - name: Upload images as artifacts
         uses: actions/upload-artifact@v4
         with:
