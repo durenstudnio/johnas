@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip zip lz4 wget file android-sdk-libsparse-utils python3 jq rsync
+          sudo apt-get install -y unzip zip lz4 wget file android-sdk-libsparse-utils python3 jq rsync e2fsprogs
           wget -nv https://github.com/danjekb/tools/raw/refs/heads/main/libssl1.0.0_1.0.2g-1ubuntu4.20_amd64.deb
           sudo dpkg -i libssl1.0.0_*.deb || true
           sudo ldconfig
@@ -145,12 +145,11 @@ jobs:
             rm -f "${BASE}.bak"
           done
 
-      # ── Fix nesting + konwersja do f2fs ───────────────────────────────
-      - name: Fix nesting and convert to f2fs
+      # ── Fix nesting + konwersja do ext4 ──────────────────────────────
+      - name: Fix nesting and convert to ext4
         run: |
           sudo apt-get update
-          sudo apt-get install -y f2fs-tools linux-modules-extra-$(uname -r) || true
-          sudo modprobe f2fs 2>/dev/null || true
+          sudo apt-get install -y e2fsprogs
 
           mkdir -p mnt_system mnt_new
 
@@ -158,21 +157,19 @@ jobs:
           sudo mount -o loop,ro partitions/system.img mnt_system
 
           OLD_SIZE=$(stat -c%s partitions/system.img)
-          NEW_SIZE=$((OLD_SIZE + 200*1024*1024))
+          NEW_SIZE=$((OLD_SIZE + 512*1024*1024))   # +512 MB
           COUNT=$((NEW_SIZE / 1024 / 1024 + 2))
 
-          # Tworzymy nowy obraz f2fs
+          # Tworzymy nowy obraz ext4
           dd if=/dev/zero of=partitions/system_new.img bs=1M count=$COUNT
-          mkfs.f2fs -f partitions/system_new.img
+          sudo mkfs.ext4 -F partitions/system_new.img
 
           sudo mount -o loop partitions/system_new.img mnt_new
 
           # Kopiujemy zawartość z naprawą zagnieżdżenia
           if [ -d "mnt_system/system" ]; then
             echo "Znaleziono zagnieżdżenie – kopiuję zawartość system/ do głównego katalogu"
-            # Kopiuj wszystko oprócz katalogu system/
             sudo rsync -a --exclude='system' mnt_system/ mnt_new/
-            # Kopiuj zawartość system/ do głównego
             sudo rsync -a mnt_system/system/ mnt_new/
           else
             echo "Brak zagnieżdżenia – kopiuję wszystko"
