@@ -188,7 +188,7 @@ jobs:
           echo "=== Rozpakowane obrazy bazy ==="
           ls -lh *.img 2>/dev/null || echo "Brak .img"
 
-      # ── Rozbijanie kontenera super.img na podobrazy ──────────────────────
+            # ── Rozbijanie kontenera super.img na podobrazy ──────────────────────
       - name: Unpack super.img to get sub-images
         run: |
           mkdir -p partitions
@@ -201,16 +201,23 @@ jobs:
             exit 1
           fi
 
-          if file "$SUPER_PATH" | grep -q "Android sparse image"; then
-            echo "Converting sparse super.img to raw..."
+          echo "Próbuję lpunpack bezpośrednio na sparse super.img..."
+          if lpunpack "$SUPER_PATH" partitions/; then
+            echo "✓ lpunpack zadziałał bezpośrednio na sparse super.img."
+          else
+            echo "⚠️  lpunpack nie poradził sobie ze sparse super.img — fallback: konwersja do raw."
             simg2img "$SUPER_PATH" base_extracted/super_raw.img
             lpunpack base_extracted/super_raw.img partitions/
-          else
-            lpunpack "$SUPER_PATH" partitions/
+            rm -f base_extracted/super_raw.img
           fi
+
+          # Usunięcie oryginalnego super.img natychmiast po wypakowaniu w celu oszczędności miejsca
+          rm -f "$SUPER_PATH"
 
           echo "===== Extracted partitions from super ====="
           ls -lh partitions/
+          df -h /
+
 
       # ── Przygotowanie obrazów CSC i Extra (Z dala od folderu 'partitions') ──
       - name: Prepare CSC and Extra partitions
