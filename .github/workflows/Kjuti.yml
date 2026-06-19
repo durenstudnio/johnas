@@ -1,0 +1,182 @@
+name: Test product Patch from Super
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # — Zwolnienie miejsca na dysku —
+      - name: Free disk space
+        run: |
+          echo "Before:"
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          docker rmi $(docker images -q) || true
+          echo "After:"
+          df -h /
+
+      # — Pobieranie oprogramowania —
+      - name: Download AP artifact
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          mkdir -p base_fw
+          curl -L \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -o ap.zip \
+            "https://api.github.com/repos/.../artifacts/.../zip"
+          unzip -q ap.zip -d base_fw
+
+      - name: Download OTA artifact
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          mkdir -p ota
+          curl -L \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -o ota.zip \
+            "https://api.github.com/repos/.../artifacts/.../zip"
+          unzip -q ota.zip -d ota
+
+      # — Instalacja dependencies —
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip simg2img
+
+          echo "Pobieranie libssl1.0.0..."
+          wget -nv https://github.com/.../libssl1.0.0_amd64.deb
+          sudo dpkg -i libssl1.0.0_*.deb
+          sudo ldconfig
+
+          echo "Pobieranie lpunpack..."
+          wget -nv -O lpunpack https://github.com/.../lpunpack
+          chmod +x lpunpack
+          sudo cp lpunpack /usr/local/bin/
+
+      - name: Download IMG Patch Tools
+        run: |
+          wget -q https://github.com/exts/IMG_Patch_Tools_0.3.zip
+          unzip -q IMG_Patch_Tools_0.3.zip
+          chmod +x IMG_Patch_Tools_0.3/Linux_x64/*
+
+      # — Ekstrakcja AP i wyciągnięcie... —
+      - name: Extract AP and Unpack product
+        run: |
+          mkdir -p base_extracted
+          APFILE=$(find base_fw -name "*.tar" -o -name "*.tar.md5" | head -n 1)
+          echo "Plik AP: $APFILE"
+
+          # Sprawdź, czy to tar.md5 czy zwykły tar
+          if [[ "$APFILE" == *.tar.md5 ]]; then
+            echo "Wykryto tar.md5 – usuwanie sumy kontrolnej..."
+            head -c -33 "$APFILE" | tar -xf - -C base_extracted super.img.lz4 || \
+            head -c -33 "$APFILE" | tar -xf - -C base_extracted super.img
+          else
+            echo "Wykryto zwykły .tar..."
+            tar -xf "$APFILE" -C base_extracted super.img.lz4 || \
+            tar -xf "$APFILE" -C base_extracted super.img
+          fi
+
+          cd base_extracted
+
+          # Dekompresja lz4
+          if [ -f super.img.lz4 ]; then
+            echo "Dekompresja lz4..."
+            lz4 -d super.img.lz4 super.img
+            rm super.img.lz4
+          fi
+
+          # Konwersja sparse -> raw
+          if [ -f super.img ] && file super.img | grep -q "Android sparse"; then
+            echo "Konwersja sparse -> raw..."
+            simg2img super.img super_raw.img
+            rm super.img
+            mv super_raw.img super.img
+          fi
+
+          # Wyciągnięcie samego product.img
+          echo "Próba wyciągnięcia tylko product.img za pomocą lpunpack..."
+          if lpunpack --partition=product super.img ./ ; then
+            echo "Sukces: wyciągnięto product.img"
+          else
+            echo "Ostrzeżenie: lpunpack z parametrem nie powiódł się, rozpakowuję wszystko..."
+            lpunpack super.img ./
+            # Kopiuj product, usuń resztę
+            if [ -f product.img ]; then
+              cp product.img ../product.img
+              rm -f *.img
+              mv ../product.img.bak product.img 2>/dev/null || mv ../product.img ./
+            fi
+          fi
+
+          # Zwolnij super.img
+          rm -f super.img
+
+          if [ ! -f product.img ]; then
+            echo "BŁĄD: Nie udało się uzyskać pliku product.img!"
+            exit 1
+          fi
+
+          echo "Rozmiar product.img:"
+          ls -lh product.img
+
+      # — Łatanie product —
+      - name: Patch product image
+        run: |
+          # Sprawdź, czy istnieją pliki ota
+          if [ ! -d ota_extracted/product ]; then
+            # (Zakładamy, że skrypt ota_extracted był przygotowany wcześniej w ota)
+            echo "BŁĄD: Brak product.transfer.list lub plików patcha!"
+            exit 1
+          fi
+
+          cp base_extracted/product.img ./
+
+          echo "Uruchamiam BlockImageUpdate..."
+          ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
+            product.img \
+            ota_extracted/product.transfer.list \
+            ota_extracted/product.new.dat.br \
+            ota_extracted/product.patch.dat
+
+          PATCH_EXIT=$?
+          if [ $PATCH_EXIT -ne 0 ]; then
+            echo "BŁĄD: Patchowanie product.img nie powiodło się!"
+            exit $PATCH_EXIT
+          fi
+          echo "Patchowanie zakończone sukcesem."
+
+      # — Weryfikacja i Logi —
+      - name: Verify result
+        run: |
+          echo "===== FILE ====="
+          file product.img
+          echo
+          echo "===== SHA1 ====="
+          sha1sum product.img
+          echo
+          echo "===== SIZE ====="
+          ls -lh product.img
+
+      # — Wrzucenie gotowego obrazu —
+      - name: Upload patched image
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-patched
+          path: product.img
+          retention-days: 7
