@@ -1,0 +1,84 @@
+# .github/workflows/reupload-artifact.yml
+#
+# Ręcznie uruchamiany workflow, który ściąga JUŻ ISTNIEJĄCY artefakt
+# z podanego run_id (np. https://github.com/<repo>/actions/runs/27813305188)
+# i wrzuca go na gofile.io oraz pixeldrain.com (oba: bez konta, do ~10GB+,
+# bez limitu czasu na gofile / 120 dni nieaktywności na pixeldrain).
+#
+# Uruchomienie: Actions -> Reupload artifact to external host -> Run workflow
+# -> wpisz run_id (sam numer z URL-a).
+
+name: Reupload artifact to external host
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID runa, z którego ściągnąć artefakt(y) (np. 27813305188)"
+        required: true
+      artifact_name:
+        description: "Nazwa konkretnego artefaktu (puste = wszystkie z runa)"
+        required: false
+        default: ""
+
+jobs:
+  reupload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pobierz artefakt(y) z poprzedniego runa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p downloaded
+          if [ -n "${{ inputs.artifact_name }}" ]; then
+            gh run download "${{ inputs.run_id }}" \
+              --repo "${{ github.repository }}" \
+              --name "${{ inputs.artifact_name }}" \
+              --dir downloaded
+          else
+            gh run download "${{ inputs.run_id }}" \
+              --repo "${{ github.repository }}" \
+              --dir downloaded
+          fi
+
+      - name: Spakuj do jednego zipa
+        run: |
+          cd downloaded
+          zip -r ../artifact.zip .
+          cd ..
+          ls -lh artifact.zip
+
+      - name: Wrzuć na gofile.io
+        id: gofile
+        continue-on-error: true
+        run: |
+          response=$(curl -sS -X POST "https://upload.gofile.io/uploadfile" -F "file=@artifact.zip")
+          echo "$response"
+          status=$(echo "$response" | jq -r '.status')
+          if [ "$status" != "ok" ]; then
+            echo "::warning::gofile upload nie powiódł się: $response"
+            exit 1
+          fi
+          link=$(echo "$response" | jq -r '.data.downloadPage')
+          echo "GOFILE_LINK=$link" >> "$GITHUB_ENV"
+
+      - name: Wrzuć na pixeldrain.com (fallback / dodatkowo)
+        id: pixeldrain
+        continue-on-error: true
+        run: |
+          response=$(curl -sS -T artifact.zip https://pixeldrain.com/api/file/)
+          echo "$response"
+          id=$(echo "$response" | jq -r '.id // empty')
+          if [ -z "$id" ]; then
+            echo "::warning::pixeldrain upload nie powiódł się: $response"
+            exit 1
+          fi
+          echo "PIXELDRAIN_LINK=https://pixeldrain.com/u/$id" >> "$GITHUB_ENV"
+
+      - name: Podsumowanie z linkami
+        run: |
+          {
+            echo "### 📦 Linki do pobrania artefaktu"
+            [ -n "$GOFILE_LINK" ] && echo "- gofile: $GOFILE_LINK"
+            [ -n "$PIXELDRAIN_LINK" ] && echo "- pixeldrain: $PIXELDRAIN_LINK"
+          } >> "$GITHUB_STEP_SUMMARY"
