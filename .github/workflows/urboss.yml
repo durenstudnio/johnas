@@ -145,27 +145,33 @@ jobs:
             rm -f "${BASE}.bak"
           done
 
-      # ── Fix nesting + konwersja do ext4 ──────────────────────────────
+      # ── Fix nesting + konwersja do ext4 (POPRAWIONA WERSJA) ─────────
       - name: Fix nesting and convert to ext4
         run: |
-          sudo apt-get update
+          # Instalacja narzędzi do F2FS (konwersja i montowanie)
           sudo apt-get install -y f2fs-tools e2fsprogs
+          
+          # KLUCZOWE: Wymuszenie załadowania modułu jądra f2fs w runnerze
           sudo modprobe f2fs 2>/dev/null || true
 
           mkdir -p mnt_system mnt_new
 
-          # Montujemy obecny system (read-only)
-          sudo mount -o loop,ro partitions/system.img mnt_system
+          # Montujemy obecny system (jawnie wskazując typ systemu plików)
+          sudo mount -o loop,ro -t f2fs partitions/system.img mnt_system
 
+          # Obliczanie nowego rozmiaru (+512MB)
           OLD_SIZE=$(stat -c%s partitions/system.img)
           NEW_SIZE=$((OLD_SIZE + 512*1024*1024))
           COUNT=$((NEW_SIZE / 1024 / 1024 + 2))
 
+          # Tworzymy nowy obraz ext4
           dd if=/dev/zero of=partitions/system_new.img bs=1M count=$COUNT
           sudo mkfs.ext4 -F partitions/system_new.img
 
+          # Montujemy nowy obraz ext4
           sudo mount -o loop partitions/system_new.img mnt_new
 
+          # Kopiujemy zawartość z naprawą zagnieżdżenia
           if [ -d "mnt_system/system" ]; then
             echo "Znaleziono zagnieżdżenie – kopiuję zawartość system/ do głównego katalogu"
             sudo rsync -a --exclude='system' mnt_system/ mnt_new/
@@ -175,9 +181,11 @@ jobs:
             sudo rsync -a mnt_system/ mnt_new/
           fi
 
+          # Odmontowanie
           sudo umount mnt_new
           sudo umount mnt_system
 
+          # Zamiana plików
           mv partitions/system_new.img partitions/system.img
           rm -rf mnt_system mnt_new
 
