@@ -1,0 +1,42 @@
+name: Inspect AP Artifact
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download AP artifact
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          mkdir -p base_fw
+          curl -L \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -o ap.zip \
+            "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7736838535/zip"
+          unzip -q ap.zip -d base_fw
+
+      - name: Inspect Artifact & List TAR Content
+        run: |
+          echo "===== ZIP CONTENT ====="
+          unzip -l ap.zip
+
+          echo ""
+          echo "===== TREE ====="
+          find base_fw | sort
+
+          echo ""
+          echo "===== DETAILED TAR.MD5 CONTENT ====="
+          # Przechodzimy po wszystkich plikach .tar.md5 i listujemy ich zawartość
+          find base_fw -type f -name "*.tar.md5" | while read -r tar_file; do
+            echo ""
+            echo "Archwum: $tar_file"
+            echo "-------------------------------------"
+            # Pliki .tar.md5 to technicznie zwykłe pliki tar z doklejonym mdscsum na końcu.
+            # Jeśli tar zgłosi błąd przez sumę kontrolną na końcu pliku, używamy opcji -i (ignore zeros).
+            tar -tvf "$tar_file" || tar -itvf "$tar_file"
+          done
