@@ -243,6 +243,14 @@ jobs:
         run: |
           echo "===== STARTING AUTOMATIC LOOP PATCHING ====="
           PATCH_FAILED_PARTS=""
+          OP_LIST="ota_extracted/dynamic_partitions_op_list"
+
+          if [ -f "$OP_LIST" ]; then
+            echo "=== dynamic_partitions_op_list (resize entries) ==="
+            grep -E "^resize " "$OP_LIST" || echo "(brak wpisów resize)"
+          else
+            echo "⚠️  Brak dynamic_partitions_op_list w OTA — resize zostanie pominięty dla wszystkich partycji."
+          fi
 
           for list in ota_extracted/*.transfer.list; do
             [ -e "$list" ] || continue
@@ -250,12 +258,38 @@ jobs:
 
             echo "Processing partition: $part_name"
 
+            # FIX: prism/optics (i podobne) nie są częścią super.img, więc nie
+            # trafiają do partitions/ — ich obraz bazowy leży w extra_partitions/
+            # (rozpakowany z CSC). Sprawdzamy oba miejsca.
+            BASE_IMG=""
             if [ -f "partitions/${part_name}.img" ]; then
+              BASE_IMG="partitions/${part_name}.img"
+            elif [ -f "extra_partitions/${part_name}.img" ]; then
+              BASE_IMG="extra_partitions/${part_name}.img"
+              echo "  (obraz bazowy znaleziony w extra_partitions/, nie w partitions/)"
+            fi
+
+            if [ -n "$BASE_IMG" ]; then
+              # ── KROK OBOWIĄZKOWY: resize do rozmiaru z dynamic_partitions_op_list ──
+              # Bez tego BlockImageUpdate może się zawiesić w ciszy (bez błędu),
+              # zamiast szybko zwrócić kod błędu — potwierdzone empirycznie na
+              # partycji product.
+              if [ -f "$OP_LIST" ]; then
+                TARGET_SIZE=$(grep -E "^resize ${part_name}(_a)? " "$OP_LIST" | awk '{print $3}' | tail -1)
+                if [ -n "$TARGET_SIZE" ]; then
+                  CURRENT_SIZE=$(stat -c%s "$BASE_IMG")
+                  if [ "$CURRENT_SIZE" -ne "$TARGET_SIZE" ]; then
+                    echo "  Resize $part_name: $CURRENT_SIZE -> $TARGET_SIZE bajtów"
+                    truncate -s "$TARGET_SIZE" "$BASE_IMG"
+                  fi
+                fi
+              fi
+
               # Work on a copy so the base image is preserved on failure
-              cp "partitions/${part_name}.img" "partitions/${part_name}.img.bak"
+              cp "$BASE_IMG" "${BASE_IMG}.bak"
 
               ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
-                "partitions/${part_name}.img" \
+                "$BASE_IMG" \
                 "ota_extracted/${part_name}.transfer.list" \
                 "ota_extracted/${part_name}.new.dat" \
                 "ota_extracted/${part_name}.patch.dat"
@@ -263,14 +297,14 @@ jobs:
 
               if [ $PATCH_EXIT -ne 0 ]; then
                 echo "⚠️  WARNING: Patching $part_name failed (exit $PATCH_EXIT) — restoring base image as fallback."
-                mv "partitions/${part_name}.img.bak" "partitions/${part_name}.img"
+                mv "${BASE_IMG}.bak" "$BASE_IMG"
                 PATCH_FAILED_PARTS="$PATCH_FAILED_PARTS $part_name"
               else
                 echo "✓  $part_name patched successfully."
-                rm -f "partitions/${part_name}.img.bak"
+                rm -f "${BASE_IMG}.bak"
               fi
             else
-              echo "WARNING: Base image for $part_name not found in partitions, skipping!"
+              echo "WARNING: Base image for $part_name not found in partitions or extra_partitions, skipping!"
             fi
           done
 
