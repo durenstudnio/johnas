@@ -10,6 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── Zwolnienie miejsca na dysku ─────────────────────────────────────
       - name: Free disk space
         run: |
           echo "Before:"
@@ -26,37 +27,69 @@ jobs:
           echo "After:"
           df -h /
 
+      # ── Pobieranie artefaktów ──────────────────────────────────────────
       - name: Download AP artifact
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p base_fw
-          curl -L \
+          echo "Pobieranie AP z artefaktu ID 7736838535..."
+          HTTP_CODE=$(curl -L -w "%{http_code}" \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
             -o ap.zip \
-            "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7736838535/zip"
+            "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7736838535/zip")
+          echo "Kod HTTP: $HTTP_CODE"
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "BŁĄD: Artefakt AP nie istnieje (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          if [ ! -s ap.zip ]; then
+            echo "BŁĄD: Pobrany plik ap.zip jest pusty!"
+            exit 1
+          fi
+          echo "Rozpakowuję ap.zip do base_fw..."
           unzip -q ap.zip -d base_fw
+          echo "Zawartość base_fw:"
+          ls -lh base_fw/
 
       - name: Download OTA artifact
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p ota
-          curl -L \
+          echo "Pobieranie OTA z artefaktu ID 7709183127..."
+          HTTP_CODE=$(curl -L -w "%{http_code}" \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
             -o ota.zip \
-            "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7709183127/zip"
+            "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7709183127/zip")
+          echo "Kod HTTP: $HTTP_CODE"
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "BŁĄD: Artefakt OTA nie istnieje (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          if [ ! -s ota.zip ]; then
+            echo "BŁĄD: Pobrany plik ota.zip jest pusty!"
+            exit 1
+          fi
+          echo "Rozpakowuję ota.zip do ota..."
           unzip -q ota.zip -d ota
+          echo "Zawartość ota:"
+          ls -lh ota/
 
+      # ── Instalacja zależności ───────────────────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y unzip zip lz4 wget file android-sdk-libsparse-utils python3 brotli
+
+          echo "Pobieranie libssl1.0.0..."
           wget -nv https://github.com/danjekb/tools/raw/refs/heads/main/libssl1.0.0_1.0.2g-1ubuntu4.20_amd64.deb
           sudo dpkg -i libssl1.0.0_*.deb || true
           sudo ldconfig
+
+          echo "Pobieranie lpunpack..."
           wget -nv -O lpunpack https://raw.githubusercontent.com/whyshhnuv/lpunpack-lpmake-mirror/Linux-debian/binary/lpunpack
           chmod +x lpunpack
           sudo cp lpunpack /usr/local/bin/
@@ -67,59 +100,135 @@ jobs:
           unzip -q IMG_Patch_Tools_0.3.zip
           chmod +x IMG_Patch_Tools_0.3/Linux_x64/*
 
+      # ── Ekstrakcja OTA ──────────────────────────────────────────────────
       - name: Extract OTA
         run: |
           mkdir -p ota_extracted
           OTAFILE=$(find ota -type f | head -1)
+          if [ -z "$OTAFILE" ]; then
+            echo "BŁĄD: Nie znaleziono pliku OTA w folderze ota!"
+            exit 1
+          fi
+          echo "Plik OTA: $OTAFILE"
           unzip -q "$OTAFILE" -d ota_extracted
-          for f in ota_extracted/*.new.dat.br; do
-            [ -f "$f" ] && brotli -d "$f"
-          done
+          if [ $? -ne 0 ]; then
+            echo "BŁĄD: Nie udało się rozpakować OTA!"
+            exit 1
+          fi
+          echo "Zawartość ota_extracted:"
+          ls -lh ota_extracted/
 
+          # Dekompresja .new.dat.br jeśli istnieją
+          for f in ota_extracted/*.new.dat.br; do
+            if [ -f "$f" ]; then
+              echo "Dekompresuję brotli: $f"
+              brotli -d "$f"
+            fi
+          done
+          echo "Zawartość po dekompresji brotli:"
+          ls -lh ota_extracted/
+
+      # ── Wyciągnięcie product.img z super.img ──────────────────────────
       - name: Extract AP and Unpack product
         run: |
           mkdir -p base_extracted
           APFILE=$(find base_fw -name "*.tar.md5" -o -name "*.tar" | head -1)
+          if [ -z "$APFILE" ]; then
+            echo "BŁĄD: Nie znaleziono pliku AP (.tar.md5 / .tar) w base_fw!"
+            exit 1
+          fi
+          echo "Plik AP: $APFILE"
+
+          # Rozpakuj TAR (z obsługą tar.md5)
           if [[ "$APFILE" == *.tar.md5 ]]; then
+            echo "Wykryto tar.md5 – usuwanie sumy (33 bajty)"
             head -c -33 "$APFILE" | tar -xf - -C base_extracted/ super.img.lz4 2>/dev/null || \
             head -c -33 "$APFILE" | tar -xf - -C base_extracted/ super.img 2>/dev/null
           else
+            echo "Wykryto zwykły .tar"
             tar -xf "$APFILE" -C base_extracted/ super.img.lz4 2>/dev/null || \
             tar -xf "$APFILE" -C base_extracted/ super.img 2>/dev/null
           fi
-          cd base_extracted
-          [ -f super.img.lz4 ] && lz4 -d super.img.lz4 super.img && rm super.img.lz4
-          if [ -f super.img ] && file super.img | grep -q "Android sparse image"; then
-            simg2img super.img super_raw.img && rm super.img && mv super_raw.img super.img
-          fi
-          if lpunpack --partition=product super.img ./ 2>/dev/null; then
-            echo "Wyciągnięto product.img"
-          else
-            lpunpack super.img ./
-            [ -f product.img ] && cp product.img ../product.img.bak && rm -f *.img && mv ../product.img.bak product.img
-          fi
-          rm -f super.img
-          [ ! -f product.img ] && echo "BŁĄD: Brak product.img" && exit 1
-          ls -lh product.img
 
+          cd base_extracted
+
+          # Dekompresja lz4
+          if [ -f super.img.lz4 ]; then
+            echo "Dekompresja super.img.lz4..."
+            lz4 -d super.img.lz4 super.img
+            rm super.img.lz4
+          fi
+
+          # Konwersja sparse → raw
+          if [ -f super.img ] && file super.img | grep -q "Android sparse image"; then
+            echo "Konwersja sparse → raw..."
+            simg2img super.img super_raw.img
+            rm super.img
+            mv super_raw.img super.img
+          fi
+
+          # Wyciągnięcie tylko product.img
+          echo "Próba wyciągnięcia product.img za pomocą lpunpack --partition..."
+          if lpunpack --partition=product super.img ./ 2>/dev/null; then
+            echo "Sukces: wyciągnięto product.img"
+          else
+            echo "Ostrzeżenie: lpunpack nie obsługuje --partition, wypakowuję wszystko..."
+            lpunpack super.img ./
+            if [ -f product.img ]; then
+              cp product.img ../product.img.bak
+              rm -f *.img
+              mv ../product.img.bak product.img
+            fi
+          fi
+
+          rm -f super.img
+
+          if [ ! -f product.img ]; then
+            echo "BŁĄD: Nie udało się uzyskać product.img!"
+            exit 1
+          fi
+
+          echo "Rozmiar product.img:"
+          ls -lh product.img
+          cd ..
+
+      # ── Patchowanie product.img ──────────────────────────────────────────
       - name: Patch product image
         run: |
-          [ ! -f ota_extracted/product.transfer.list ] && echo "BŁĄD: Brak product.transfer.list" && exit 1
-          cp base_extracted/product.img ./
+          if [ ! -f ota_extracted/product.transfer.list ]; then
+            echo "BŁĄD: Brak product.transfer.list – OTA nie zawiera łatki dla product."
+            exit 1
+          fi
+
+          cp base_extracted/product.img ./product.img
+
+          echo "Uruchamiam BlockImageUpdate dla product..."
           ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
             product.img \
             ota_extracted/product.transfer.list \
             ota_extracted/product.new.dat \
             ota_extracted/product.patch.dat
-          [ $? -ne 0 ] && echo "Patchowanie nie powiodło się" && exit 1
-          echo "Patchowanie zakończone sukcesem"
 
+          PATCH_EXIT=$?
+          if [ $PATCH_EXIT -ne 0 ]; then
+            echo "BŁĄD: Patchowanie product.img zakończyło się kodem $PATCH_EXIT"
+            exit $PATCH_EXIT
+          fi
+          echo "Patchowanie zakończone pomyślnie."
+
+      # ── Weryfikacja ──────────────────────────────────────────────────────
       - name: Verify result
         run: |
-          echo "===== FILE =====" && file product.img
-          echo "===== SHA1 =====" && sha1sum product.img
-          echo "===== SIZE =====" && ls -lh product.img
+          echo "===== FILE ====="
+          file product.img
+          echo
+          echo "===== SHA1 ====="
+          sha1sum product.img
+          echo
+          echo "===== SIZE ====="
+          ls -lh product.img
 
+      # ── Upload artefaktu ─────────────────────────────────────────────────
       - name: Upload patched image
         uses: actions/upload-artifact@v4
         with:
