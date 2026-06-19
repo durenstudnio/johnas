@@ -68,7 +68,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip zip lz4 wget file android-sdk-libsparse-utils python3
+          sudo apt-get install -y unzip zip lz4 wget file android-sdk-libsparse-utils python3 jq
 
           echo "Pobieranie libssl1.0.0..."
           wget -nv https://github.com/danjekb/tools/raw/refs/heads/main/libssl1.0.0_1.0.2g-1ubuntu4.20_amd64.deb
@@ -575,8 +575,57 @@ jobs:
           path: final_output/*.tar.md5
           retention-days: 7
 
-      # ── Upload na gofile.io ──────────────────────────────────────────────
-      - name: Upload na gofile.io
-        uses: ahnafnafee/action-upload-gofile@v3.0.0
-        with:
-          file: final_output/*.tar.md5
+      # ── Upload na GoFile (API v2) ───────────────────────────────────────
+      - name: Upload na GoFile
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+        run: |
+          FILE=$(find final_output -name "*.tar.md5" | head -1)
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: Nie znaleziono pliku .tar.md5"
+            exit 1
+          fi
+
+          echo "Plik do uploadu: $FILE"
+
+          echo "Pobieranie najlepszego serwera GoFile..."
+          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+
+          if [ -z "$SERVER" ] || [ "$SERVER" = "null" ]; then
+            echo "ERROR: Nie udało się pobrać serwera GoFile"
+            exit 1
+          fi
+
+          echo "Serwer: $SERVER"
+
+          RESPONSE=$(curl -s \
+            -F "file=@${FILE}" \
+            -F "token=${GOFILE_TOKEN}" \
+            "https://${SERVER}.gofile.io/uploadFile")
+
+          echo "$RESPONSE"
+
+          STATUS=$(echo "$RESPONSE" | jq -r '.status')
+
+          if [ "$STATUS" != "ok" ]; then
+            echo "ERROR: Upload nie powiódł się"
+            exit 1
+          fi
+
+          DOWNLOAD_PAGE=$(echo "$RESPONSE" | jq -r '.data.downloadPage')
+          DIRECT_LINK=$(echo "$RESPONSE" | jq -r '.data.directLink')
+
+          echo ""
+          echo "======================================="
+          echo "UPLOAD ZAKOŃCZONY"
+          echo ""
+          echo "DOWNLOAD PAGE:"
+          echo "$DOWNLOAD_PAGE"
+          echo ""
+          echo "DIRECT LINK:"
+          echo "$DIRECT_LINK"
+          echo "======================================="
+
+          echo "download_page=$DOWNLOAD_PAGE" >> $GITHUB_OUTPUT
+          echo "direct_link=$DIRECT_LINK" >> $GITHUB_OUTPUT
