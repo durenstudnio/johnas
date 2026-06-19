@@ -52,6 +52,7 @@ jobs:
             -o ap.zip \
             "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7736838535/zip"
           unzip -q ap.zip -d base_fw
+          rm -f ap.zip
           df -h /
 
       - name: Download OTA artifact
@@ -65,6 +66,7 @@ jobs:
             -o ota.zip \
             "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7709183127/zip"
           unzip -q ota.zip -d ota
+          rm -f ota.zip
           df -h /
 
       - name: Extract OTA product files only
@@ -74,24 +76,32 @@ jobs:
 
           # Extract just the files we need for this test (saves time/space)
           unzip -l "$OTAFILE" | grep -i "^.*product" || true
-          unzip -q -o "$OTAFILE" -d ota_extracted "product.transfer.list" "product.new.dat*" "product.patch.dat" || \
+          unzip -q -o "$OTAFILE" -d ota_extracted "product.transfer.list" "product.new.dat*" "product.patch.dat" "dynamic_partitions_op_list" || \
           unzip -q "$OTAFILE" -d ota_extracted
 
           echo "=== product files from OTA ==="
           ls -lh ota_extracted/ | grep product
 
+          echo "=== dynamic_partitions_op_list (resize entries) ==="
+          grep -E "^resize " ota_extracted/dynamic_partitions_op_list || echo "(brak pliku albo brak wpisów resize)"
+
       - name: Wypakuj AP (z obsługą zagnieżdżonych zipów)
         run: |
           mkdir -p base_extracted
 
+          # FIX: poprzednio rozpakowywaliśmy CAŁY zagnieżdżony zip (BL+AP+CP+CSC+HOME_CSC),
+          # co zajmowało ~10GB miejsca na dysku dla testu, który potrzebuje tylko AP.
+          # Teraz wyciągamy z niego TYLKO plik AP_*.
           for i in 1 2 3; do
             FOUND_TAR=$(find base_fw -name "*.tar.md5" -o -name "*.tar" 2>/dev/null | head -1)
             [ -n "$FOUND_TAR" ] && break
             NESTED_ZIP=$(find base_fw -name "*.zip" | head -1)
             [ -z "$NESTED_ZIP" ] && break
-            echo "Rozpakowuję zagnieżdżony zip: $NESTED_ZIP"
-            unzip -q -o "$NESTED_ZIP" -d base_fw
+            echo "Rozpakowuję TYLKO plik AP_* z zagnieżdżonego zipa: $NESTED_ZIP"
+            unzip -l "$NESTED_ZIP" | grep -i "^.*AP_" || true
+            unzip -q -o "$NESTED_ZIP" -d base_fw "AP_*" || unzip -q -o "$NESTED_ZIP" -d base_fw
             rm -f "$NESTED_ZIP"
+            df -h /
           done
 
           TARFILE=$(find base_fw -name "*.tar.md5" | head -1)
@@ -107,8 +117,7 @@ jobs:
 
           echo "Znaleziono AP: $TARFILE"
 
-          # Try to extract ONLY super.img / super.img.lz4 from the tar to save disk+time.
-          # tar can seek past unwanted entries on an uncompressed tar stream.
+          # Wyciągamy TYLKO super.img / super.img.lz4 z tar (tar przeskakuje resztę bez zapisu na dysk)
           ENTRY=$(head -c -33 "$TARFILE" | tar -t 2>/dev/null | grep -E "^super\.img" | head -1)
           if [ -n "$ENTRY" ]; then
             echo "Wyciągam tylko: $ENTRY"
@@ -118,7 +127,13 @@ jobs:
             head -c -33 "$TARFILE" | tar -x -C base_extracted/
           fi
 
+          # FIX: usuwamy AP_xxx.tar.md5 (~8,5GB) — już niepotrzebny, mamy super.img.lz4
+          rm -f "$TARFILE"
+
+          echo "=== Po ekstrakcji super.img ==="
           ls -lh base_extracted/
+          echo "=== Pozostałość w base_fw (powinno być ~puste) ==="
+          du -sh base_fw 2>/dev/null || true
           df -h /
 
       - name: Zdekompresuj super.img.lz4 jeśli potrzeba
@@ -144,11 +159,17 @@ jobs:
           if file "$SUPER_PATH" | grep -q "Android sparse image"; then
             echo "Konwertuję sparse -> raw..."
             simg2img "$SUPER_PATH" base_extracted/super_raw.img
+            rm -f "$SUPER_PATH"
             SUPER_PATH=base_extracted/super_raw.img
           fi
 
           # lpunpack supports extracting a single partition with -p
           lpunpack -p product "$SUPER_PATH" partitions/ || lpunpack -p product_a "$SUPER_PATH" partitions/
+
+          # FIX: super.img/super_raw.img (~9GB każdy) już niepotrzebne — usuwamy
+          # natychmiast, zanim zaczniemy patchowanie (które i tak potrzebuje miejsca
+          # na cache/stash).
+          rm -f "$SUPER_PATH"
 
           echo "=== Wyciągnięte ==="
           ls -lh partitions/
@@ -160,7 +181,50 @@ jobs:
           fi
 
           # normalize name to product.img
-          [ -f partitions/product_a.img ] && mv partitions/product_a.img partitions/product.img
+          # FIX: pod `bash -e`, samo "[ -f x ] && cmd" zwraca exit 1 (i ubija krok)
+          # gdy plik nie istnieje — nawet jeśli to oczekiwane i nieszkodliwe.
+          if [ -f partitions/product_a.img ]; then
+            mv partitions/product_a.img partitions/product.img
+          fi
+
+      # ── KLUCZOWY KROK (wcześniej brakujący): resize obrazu do rozmiaru z OTA ──
+      # Z tutoriala: "You must resize images exactly as defined in
+      # dynamic_partitions_op_list. If you skip this step, patching will abort"
+      # (albo, jak widzieliśmy — zawiesi się bez żadnego komunikatu błędu).
+      - name: Resize product.img zgodnie z dynamic_partitions_op_list (KROK OBOWIĄZKOWY)
+        run: |
+          OP_LIST="ota_extracted/dynamic_partitions_op_list"
+
+          if [ ! -f "$OP_LIST" ]; then
+            echo "⚠️  Brak dynamic_partitions_op_list w OTA — nie mogę zweryfikować docelowego rozmiaru."
+            echo "    Kontynuuję z oryginalnym rozmiarem product.img, ale to ryzykowne."
+            exit 0
+          fi
+
+          echo "=== Pełna zawartość op_list dla product ==="
+          grep -i "product" "$OP_LIST" || echo "(brak wpisów dla product)"
+
+          # Szukamy linii w stylu: "resize product 1234567890" lub "resize product_a 1234567890"
+          TARGET_SIZE=$(grep -E "^resize product(_a)? " "$OP_LIST" | awk '{print $3}' | tail -1)
+
+          if [ -z "$TARGET_SIZE" ]; then
+            echo "ℹ️  Brak wpisu 'resize product' w op_list — partycja może nie wymagać zmiany rozmiaru."
+            CURRENT_SIZE=$(stat -c%s partitions/product.img)
+            echo "    Obecny rozmiar product.img: $CURRENT_SIZE bajtów (bez zmian)"
+            exit 0
+          fi
+
+          CURRENT_SIZE=$(stat -c%s partitions/product.img)
+          echo "Obecny rozmiar product.img:   $CURRENT_SIZE bajtów"
+          echo "Docelowy rozmiar (z op_list): $TARGET_SIZE bajtów"
+
+          if [ "$CURRENT_SIZE" -eq "$TARGET_SIZE" ]; then
+            echo "✓ Rozmiar już się zgadza, nic do zrobienia."
+          else
+            echo "Wykonuję: truncate -s $TARGET_SIZE partitions/product.img"
+            truncate -s "$TARGET_SIZE" partitions/product.img
+            echo "✓ Nowy rozmiar: $(stat -c%s partitions/product.img) bajtów"
+          fi
 
       # ── Faktyczny test patchowania, z monitoringiem i timeoutem ─────────
       - name: Patch product (z monitoringiem zasobów + timeout)
