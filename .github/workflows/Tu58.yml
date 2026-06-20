@@ -1,0 +1,103 @@
+name: List OTA contents and upload to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag release (np. v1.0)'
+        required: true
+        default: 'latest'
+      artifact_id:
+        description: 'ID artefaktu OTA (domyślnie 7709183127)'
+        required: false
+        default: '7709183127'
+
+jobs:
+  list-ota:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download OTA artifact
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          mkdir -p ota
+          curl -L \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -o ota.zip \
+            "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/${{ github.event.inputs.artifact_id }}/zip"
+          unzip -q ota.zip -d ota
+
+      - name: Extract OTA contents
+        run: |
+          mkdir -p ota_extracted
+          OTAFILE=$(find ota -type f | head -1)
+          if [ -z "$OTAFILE" ]; then
+            echo "ERROR: No OTA file found in downloaded artifact"
+            exit 1
+          fi
+          echo "Extracting $OTAFILE"
+          unzip -q "$OTAFILE" -d ota_extracted
+
+      - name: Generate file list
+        run: |
+          echo "Listing contents of ota_extracted:" > ota_filelist.txt
+          echo "=====================================" >> ota_filelist.txt
+          ls -laR ota_extracted >> ota_filelist.txt
+          echo "" >> ota_filelist.txt
+          echo "File sizes and types:" >> ota_filelist.txt
+          find ota_extracted -type f -exec ls -lh {} \; >> ota_filelist.txt
+
+      - name: Upload file list as artifact (for debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ota-filelist
+          path: ota_filelist.txt
+          retention-days: 7
+
+      - name: Create Release (if not exists) and upload asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          RELEASE_TAG="${{ github.event.inputs.release_tag }}"
+          if [ -z "$RELEASE_TAG" ] || [ "$RELEASE_TAG" = "latest" ]; then
+            RELEASE_TAG="ota-list-$(date +'%Y%m%d-%H%M%S')"
+          fi
+
+          # Sprawdź czy release już istnieje
+          EXISTING_RELEASE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG" || echo "")
+
+          if echo "$EXISTING_RELEASE" | grep -q '"id":'; then
+            echo "Release $RELEASE_TAG already exists, will upload asset to it."
+            RELEASE_ID=$(echo "$EXISTING_RELEASE" | jq -r '.id')
+          else
+            echo "Creating new release $RELEASE_TAG"
+            CREATE_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"$RELEASE_TAG\",\"name\":\"OTA file list $RELEASE_TAG\",\"body\":\"Lista plików OTA\",\"draft\":false,\"prerelease\":false}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases")
+            RELEASE_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
+            if [ "$RELEASE_ID" = "null" ]; then
+              echo "Failed to create release"
+              echo "$CREATE_RESPONSE"
+              exit 1
+            fi
+          fi
+
+          # Upload asset (plik ota_filelist.txt)
+          ASSET_NAME="ota_filelist_${RELEASE_TAG}.txt"
+          curl -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@ota_filelist.txt" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$ASSET_NAME"
+
+          echo "Asset uploaded: $ASSET_NAME"
