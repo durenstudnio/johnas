@@ -85,22 +85,27 @@ jobs:
             exit 1
           fi
 
-          # Post-processing: Rozpakowanie artefaktów (z automatycznym rozpakowywaniem zagnieżdżonych zipów)
+          # Post-processing: Rozpakowanie firmware
           echo "Rozpakowywanie firmware.zip..."
           unzip -q firmware.zip -d firmware_zip
           rm -f firmware.zip
           find firmware_zip -type f -name "*.zip" -exec unzip -q -o {} -d firmware_zip/ \;
 
+          # Post-processing: Rozpakowanie OTA
           echo "Rozpakowywanie ota.zip..."
           unzip -q ota.zip -d ota
           rm -f ota.zip
-          find ota -type f -name "*.zip" -exec unzip -q -o {} -d ota/ \;
-
-          OTAFILE=$(find ota -type f | head -1)
+          
+          OTAFILE=$(find ota -type f -name "*.zip" | head -1)
           if [ -n "$OTAFILE" ]; then
+            echo "Znaleziono OTA payload ($OTAFILE). Rozpakowywanie do ota_extracted..."
             unzip -q "$OTAFILE" -d ota_extracted
             find ota_extracted -type f -name "*.zip" -exec unzip -q -o {} -d ota_extracted/ \;
+          else
+            echo "Brak .zip w OTA. Przenoszę pliki bezpośrednio do ota_extracted..."
+            cp -r ota/* ota_extracted/ 2>/dev/null || true
           fi
+          rm -rf ota
 
           # Post-processing: Instalacja pobranych narzędzi
           sudo dpkg -i libssl.deb || true
@@ -121,7 +126,6 @@ jobs:
         run: |
           mkdir -p base_extracted csc_extracted final_output
 
-          # Szukamy wszystkich plików .tar.md5 w firmware_zip (rekursywnie)
           TARS=$(find firmware_zip -type f -name "*.tar.md5")
           
           if [ -z "$TARS" ]; then
@@ -178,7 +182,7 @@ jobs:
             rm "$f"
           done
           echo "=== Rozpakowane obrazy bazy (AP) ==="
-          ls -lh *.img 2>/dev/null || find . -name "*.img" -exec ls -lh {} \;
+          find . -name "*.img" -exec ls -lh {} \;
 
       # ── Przygotowanie CSC i extra partitions (dekompresja lz4 CSC) ──────
       - name: Prepare CSC and Extra partitions
@@ -267,6 +271,9 @@ jobs:
             part_name=$(basename "$list" .transfer.list)
             echo "Processing partition: $part_name"
 
+            # Pobieranie katalogu, w którym znajduje się transfer.list (aby znaleźć tam new.dat i patch.dat)
+            LIST_DIR=$(dirname "$list")
+
             BASE_IMG=""
             if [ -f "partitions/${part_name}.img" ]; then
               BASE_IMG="partitions/${part_name}.img"
@@ -296,8 +303,8 @@ jobs:
               ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
                 "$BASE_IMG" \
                 "$list" \
-                "ota_extracted/${part_name}.new.dat" \
-                "ota_extracted/${part_name}.patch.dat" 2>&1 | tee "$PATCH_LOG"
+                "${LIST_DIR}/${part_name}.new.dat" \
+                "${LIST_DIR}/${part_name}.patch.dat" 2>&1 | tee "$PATCH_LOG"
               PROC_EXIT=${PIPESTATUS[0]}
 
               INTERNAL_CODE=$(grep -oE "error code[[:space:]]*:[[:space:]]*-?[0-9]+" "$PATCH_LOG" | tail -1 | grep -oE "\-?[0-9]+$")
@@ -485,16 +492,18 @@ jobs:
           fi
           rm -rf csc_final
 
+          # Poprawne generowanie plików .tar.md5 (dopisanie 33-bajtowego hasha do pliku tar)
           cd final_output
           for f in *.tar; do
             if [ -f "$f" ]; then
-              md5sum -b "$f" >> "${f}.md5"
+              echo "Generuję MD5 dla $f..."
+              md5sum "$f" | awk '{print $1}' >> "$f"
               mv "$f" "${f}.md5"
             fi
           done
           cd ..
 
-          rm -rf final_partitions base_extracted ota ota_extracted csc_extracted extra_partitions partitions super_input
+          rm -rf final_partitions base_extracted ota_extracted csc_extracted extra_partitions partitions super_input
 
           echo "=== Zawartość final_output ==="
           ls -lh final_output/
