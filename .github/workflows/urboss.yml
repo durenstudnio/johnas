@@ -51,7 +51,7 @@ jobs:
             "https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7709183127/zip") &
           PIDS+=($!)
 
-          # 3. Pobieranie libssl (w tle) - POPRAWIONY LINK (danjekb)
+          # 3. Pobieranie libssl (w tle)
           (wget -nv -q -O libssl.deb "https://github.com/danjekb/tools/raw/refs/heads/main/libssl1.0.0_1.0.2g-1ubuntu4.20_amd64.deb") &
           PIDS+=($!)
 
@@ -85,17 +85,22 @@ jobs:
             exit 1
           fi
 
-          # Post-processing: Rozpakowanie artefaktów
+          # Post-processing: Rozpakowanie artefaktów (z automatycznym rozpakowywaniem zagnieżdżonych zipów)
           echo "Rozpakowywanie firmware.zip..."
           unzip -q firmware.zip -d firmware_zip
           rm -f firmware.zip
+          find firmware_zip -type f -name "*.zip" -exec unzip -q -o {} -d firmware_zip/ \;
 
           echo "Rozpakowywanie ota.zip..."
           unzip -q ota.zip -d ota
           rm -f ota.zip
+          find ota -type f -name "*.zip" -exec unzip -q -o {} -d ota/ \;
 
           OTAFILE=$(find ota -type f | head -1)
-          unzip -q "$OTAFILE" -d ota_extracted
+          if [ -n "$OTAFILE" ]; then
+            unzip -q "$OTAFILE" -d ota_extracted
+            find ota_extracted -type f -name "*.zip" -exec unzip -q -o {} -d ota_extracted/ \;
+          fi
 
           # Post-processing: Instalacja pobranych narzędzi
           sudo dpkg -i libssl.deb || true
@@ -116,8 +121,16 @@ jobs:
         run: |
           mkdir -p base_extracted csc_extracted final_output
 
-          for tar in firmware_zip/*.tar.md5; do
-            [ -e "$tar" ] || continue
+          # Szukamy wszystkich plików .tar.md5 w firmware_zip (rekursywnie)
+          TARS=$(find firmware_zip -type f -name "*.tar.md5")
+          
+          if [ -z "$TARS" ]; then
+            echo "BŁĄD: Nie znaleziono żadnych plików *.tar.md5 w firmware_zip!"
+            find firmware_zip -type f -exec ls -lh {} \;
+            exit 1
+          fi
+
+          echo "$TARS" | while IFS= read -r tar; do
             case $(basename "$tar") in
               BL_*)
                 echo "BL: $tar → kopiuję do final_output"
@@ -159,14 +172,13 @@ jobs:
       - name: Zdekompresuj obrazy lz4 (AP)
         run: |
           cd base_extracted
-          for f in *.lz4; do
-            [ -f "$f" ] || continue
+          find . -name "*.lz4" | while IFS= read -r f; do
             echo "Dekompresuję: $f"
             lz4 -d "$f" "${f%.lz4}"
             rm "$f"
           done
           echo "=== Rozpakowane obrazy bazy (AP) ==="
-          ls -lh *.img 2>/dev/null || echo "Brak .img"
+          ls -lh *.img 2>/dev/null || find . -name "*.img" -exec ls -lh {} \;
 
       # ── Przygotowanie CSC i extra partitions (dekompresja lz4 CSC) ──────
       - name: Prepare CSC and Extra partitions
@@ -174,22 +186,26 @@ jobs:
           mkdir -p extra_partitions
 
           cd csc_extracted
-          for f in *.lz4; do
-            [ -f "$f" ] || continue
+          find . -name "*.lz4" | while IFS= read -r f; do
             echo "Dekompresuję CSC: $f"
             lz4 -d "$f" "${f%.lz4}"
             rm "$f"
           done
           cd ..
 
-          if [ -f base_extracted/vm-bootsys.img ]; then
-            cp base_extracted/vm-bootsys.img extra_partitions/
+          VM_FILE=$(find base_extracted -name "vm-bootsys.img" | head -1)
+          if [ -n "$VM_FILE" ]; then
+            cp "$VM_FILE" extra_partitions/
           fi
-          if [ -f csc_extracted/prism.img ]; then
-            cp csc_extracted/prism.img extra_partitions/prism.img
+          
+          PRISM_FILE=$(find csc_extracted -name "prism.img" | head -1)
+          if [ -n "$PRISM_FILE" ]; then
+            cp "$PRISM_FILE" extra_partitions/prism.img
           fi
-          if [ -f csc_extracted/optics.img ]; then
-            cp csc_extracted/optics.img extra_partitions/optics.img
+          
+          OPTICS_FILE=$(find csc_extracted -name "optics.img" | head -1)
+          if [ -n "$OPTICS_FILE" ]; then
+            cp "$OPTICS_FILE" extra_partitions/optics.img
           fi
 
           echo "===== Extra/CSC Partitions ready ====="
@@ -203,7 +219,7 @@ jobs:
 
           if [ -z "$SUPER_PATH" ]; then
             echo "BŁĄD: Nie znaleziono pliku super.img w base_extracted!"
-            ls -R base_extracted
+            find base_extracted -type f -exec ls -lh {} \;
             exit 1
           fi
 
@@ -238,17 +254,16 @@ jobs:
         run: |
           echo "===== STARTING AUTOMATIC LOOP PATCHING ====="
           PATCH_FAILED_PARTS=""
-          OP_LIST="ota_extracted/dynamic_partitions_op_list"
+          OP_LIST=$(find ota_extracted -name "dynamic_partitions_op_list" | head -1)
 
-          if [ -f "$OP_LIST" ]; then
+          if [ -n "$OP_LIST" ]; then
             echo "=== dynamic_partitions_op_list (resize entries) ==="
             grep -E "^resize " "$OP_LIST" || echo "(brak wpisów resize)"
           else
             echo "⚠️  Brak dynamic_partitions_op_list w OTA — resize zostanie pominięty."
           fi
 
-          for list in ota_extracted/*.transfer.list; do
-            [ -e "$list" ] || continue
+          while IFS= read -r list; do
             part_name=$(basename "$list" .transfer.list)
             echo "Processing partition: $part_name"
 
@@ -262,7 +277,7 @@ jobs:
             if [ -n "$BASE_IMG" ]; then
               RESIZE_MODE="none"
               TARGET_SIZE=""
-              if [ -f "$OP_LIST" ]; then
+              if [ -n "$OP_LIST" ]; then
                 TARGET_SIZE=$(grep -E "^resize ${part_name}(_a)? " "$OP_LIST" | awk '{print $3}' | tail -1)
                 if [ -n "$TARGET_SIZE" ]; then
                   CURRENT_SIZE=$(stat -c%s "$BASE_IMG")
@@ -280,7 +295,7 @@ jobs:
 
               ./IMG_Patch_Tools_0.3/Linux_x64/BlockImageUpdate \
                 "$BASE_IMG" \
-                "ota_extracted/${part_name}.transfer.list" \
+                "$list" \
                 "ota_extracted/${part_name}.new.dat" \
                 "ota_extracted/${part_name}.patch.dat" 2>&1 | tee "$PATCH_LOG"
               PROC_EXIT=${PIPESTATUS[0]}
@@ -305,7 +320,7 @@ jobs:
                 fi
               fi
             fi
-          done
+          done < <(find ota_extracted -name "*.transfer.list")
 
       # ── Rekonstrukcja SUPER ──────────────────────────────────────────────
       - name: Przebudowa dynamicznego obrazu SUPER
@@ -320,8 +335,15 @@ jobs:
           import math
           import subprocess
           import sys
+          import glob
 
-          op_list = "ota_extracted/dynamic_partitions_op_list"
+          op_list_files = glob.glob("ota_extracted/**/dynamic_partitions_op_list", recursive=True)
+          op_list = op_list_files[0] if op_list_files else ""
+          if op_list:
+              print(f"Znaleziono op_list: {op_list}")
+          else:
+              print("⚠️  Brak dynamic_partitions_op_list w OTA — używam wartości domyślnych!")
+
           parts_dir = "super_input"
           output_img = "final_partitions/super.img"
 
@@ -341,7 +363,7 @@ jobs:
               return int(math.ceil(size / 4096.0) * 4096)
 
           resize_targets = {}
-          if os.path.exists(op_list):
+          if op_list and os.path.exists(op_list):
               with open(op_list, "r") as f:
                   for line in f:
                       line = line.strip()
@@ -409,17 +431,17 @@ jobs:
       - name: Skopiuj obrazy statyczne spoza super
         run: |
           for img in boot.img dtbo.img vbmeta.img vbmeta_system.img init_boot.img vendor_boot.img vm-bootsys.img prism.img optics.img; do
-            OTA_IMG="ota_extracted/$img"
-            EXTRA_IMG="extra_partitions/$img"
-            BASE_IMG="base_extracted/$img"
+            OTA_IMG=$(find ota_extracted -name "$img" | head -1)
+            EXTRA_IMG=$(find extra_partitions -name "$img" | head -1)
+            BASE_IMG=$(find base_extracted -name "$img" | head -1)
 
-            if [ -f "$OTA_IMG" ]; then
+            if [ -n "$OTA_IMG" ]; then
               cp "$OTA_IMG" "final_partitions/$img"
               echo "✓ $img (zastąpiono nowym z OTA)"
-            elif [ -f "$EXTRA_IMG" ]; then
+            elif [ -n "$EXTRA_IMG" ]; then
               cp "$EXTRA_IMG" "final_partitions/$img"
               echo "✓ $img (skopiowano z folderu extra/CSC)"
-            elif [ -f "$BASE_IMG" ]; then
+            elif [ -n "$BASE_IMG" ]; then
               cp "$BASE_IMG" "final_partitions/$img"
               echo "  $img (zachowano oryginalny z bazy)"
             fi
@@ -430,12 +452,14 @@ jobs:
         run: |
           mkdir ap_final
           for img in boot dtbo vbmeta vbmeta_system init_boot vendor_boot vm-bootsys super; do
-            if [ -f final_partitions/${img}.img ]; then
-              cp final_partitions/${img}.img ap_final/
+            IMG_PATH=$(find final_partitions -name "${img}.img" | head -1)
+            if [ -n "$IMG_PATH" ]; then
+              cp "$IMG_PATH" ap_final/
             fi
           done
-          if [ -f final_partitions/recovery.img ]; then
-            cp final_partitions/recovery.img ap_final/
+          REC_PATH=$(find final_partitions -name "recovery.img" | head -1)
+          if [ -n "$REC_PATH" ]; then
+            cp "$REC_PATH" ap_final/
           fi
 
           if [ -n "$(ls ap_final/*.img 2>/dev/null)" ]; then
@@ -447,8 +471,9 @@ jobs:
 
           mkdir csc_final
           for img in prism optics; do
-            if [ -f final_partitions/${img}.img ]; then
-              cp final_partitions/${img}.img csc_final/
+            IMG_PATH=$(find final_partitions -name "${img}.img" | head -1)
+            if [ -n "$IMG_PATH" ]; then
+              cp "$IMG_PATH" csc_final/
             fi
           done
           find csc_extracted -name "*.img" ! -name "prism.img" ! -name "optics.img" -exec cp {} csc_final/ \;
