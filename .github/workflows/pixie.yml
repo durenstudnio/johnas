@@ -1,0 +1,55 @@
+name: Upload Artifact to Pixeldrain
+
+on:
+  workflow_dispatch: # Pozwala na ręczne uruchomienie workflow z panelu GitHub Actions
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Pobieranie artefaktu za pomocą GitHub API na podstawie podanego URL
+      # Wykorzystujemy curl i token, ponieważ standardowe "actions/download-artifact" działa automatycznie tylko w obrębie bieżącego uruchomienia.
+      - name: Download Artifact from Specific Run
+        run: |
+          echo "Pobieranie artefaktu..."
+          # Artefakt w GitHub API pobiera się jako archiwum ZIP
+          curl -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/durenstudnio/johnas/actions/artifacts/7747143777/zip \
+            -o artifact.zip
+          
+          echo "Rozpakowywanie artefaktu..."
+          unzip artifact.zip -d extracted_artifact/
+
+      # 2. Wyszukanie rozpakowanego pliku i przesłanie go na Pixeldrain
+      - name: Upload to Pixeldrain
+        run: |
+          # Przechodzimy do folderu z rozpakowaną zawartością
+          cd extracted_artifact/
+          
+          # Znajdujemy pierwszy plik w tym katalogu (zakładamy, że artefakt zawiera jeden główny plik)
+          FILE_NAME=$(ls -A1 | head -n 1)
+          
+          if [ -z "$FILE_NAME" ]; then
+            echo "Błąd: Nie znaleziono żadnego pliku w artefakcie!"
+            exit 1
+          fi
+          
+          echo "Wysyłanie pliku '$FILE_NAME' do Pixeldrain..."
+          
+          # Wysyłanie pliku za pomocą API Pixeldrain z uwierzytelnieniem Basic Auth (twój klucz jako hasło)
+          RESPONSE=$(curl -u ":${{ secrets.PIXELDRAIN_API_KEY }}" -F "file=@$FILE_NAME" https://pixeldrain.com/api/file)
+          
+          echo "Odpowiedź od Pixeldrain:"
+          echo "$RESPONSE"
+          
+          # Wyciągnięcie ID pliku z odpowiedzi JSON (wymaga narzędzia jq, które jest domyślnie na Ubuntu w GitHub Actions)
+          FILE_ID=$(echo $RESPONSE | jq -r '.id')
+          
+          echo "=========================================="
+          echo "Plik został pomyślnie wysłany!"
+          echo "Link do pliku: https://pixeldrain.com/u/$FILE_ID"
+          echo "=========================================="
