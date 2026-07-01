@@ -1,0 +1,85 @@
+name: Repack Vendor Boot (EROFS to EXT4) - z Linku
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: 'Wklej bezpośredni link do pliku vendor_boot.img'
+        required: true
+        type: string
+
+jobs:
+  repack:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cpio python3 curl
+
+    - name: Download and Setup AIK
+      run: |
+        mkdir AIK
+        cd AIK
+        # Pobieramy skrypty AIK z działającego mirroru
+        git clone https://github.com/SebaUbuntu/AIK-Linux-Mirror.git .
+        chmod +x *.sh
+        
+        # Pobieranie vendor_boot.img za pomocą curl
+        echo "Pobieram plik z: ${{ github.event.inputs.download_url }}"
+        curl -L -o vendor_boot.img "${{ github.event.inputs.download_url }}"
+        
+        # Szybki check czy plik nie jest pusty
+        if [ ! -s "vendor_boot.img" ]; then
+          echo "BŁĄD: Plik jest pusty lub nie udało się go pobrać!"
+          exit 1
+        fi
+
+    - name: Unpack Vendor Boot Image
+      run: |
+        cd AIK
+        ./unpackimg.sh vendor_boot.img
+
+    - name: Modify FSTAB (EROFS to EXT4)
+      run: |
+        cd AIK/ramdisk
+        
+        # Szukamy fstab w ramdisku Samsunga (fstab.qcom lub fstab.emmc)
+        FSTAB_FILE=$(sudo find . -name "fstab.*" | head -n 1)
+        if [ -z "$FSTAB_FILE" ]; then
+          FSTAB_FILE=$(sudo find . -name "fstab" | head -n 1)
+        fi
+        
+        if [ ! -z "$FSTAB_FILE" ]; then
+          echo "Znaleziono fstab: $FSTAB_FILE. Podmieniam EROFS na EXT4 za pomocą sudo..."
+          
+          # Wymuszamy pełne uprawnienia przez sudo dla tego konkretnego pliku fstab
+          sudo chmod 777 "$FSTAB_FILE"
+          
+          # Zmiana systemów plików w tekście przy użyciu sudo
+          sudo sed -i 's/\terofs\t/\text4\t/g' "$FSTAB_FILE"
+          sudo sed -i 's/ erofs / ext4 /g' "$FSTAB_FILE"
+          
+          echo "=== PODGLĄD ZMODYFIKOWANEGO FSTAB ==="
+          sudo cat "$FSTAB_FILE"
+          echo "====================================="
+        else
+          echo "BŁĄD: Nie znaleziono pliku fstab w ramdisku vendor_boot!"
+          exit 1
+        fi
+
+    - name: Repack Vendor Boot Image
+      run: |
+        cd AIK
+        ./repackimg.sh
+        mv image-new.img ../vendor_boot_ext4.img
+
+    - name: Upload Finished Vendor Boot
+      uses: actions/upload-artifact@v4
+      with:
+        name: vendor_boot-ext4-modified
+        path: vendor_boot_ext4.img
